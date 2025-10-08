@@ -5,6 +5,7 @@ from aiogram import Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.enums import ParseMode
 from aiogram.types import Message
 from aiogram.exceptions import TelegramBadRequest
 
@@ -23,19 +24,28 @@ class SearchStates(StatesGroup):
 @router.message(Command("search"))
 async def search_command(message: Message, state: FSMContext) -> None:
     await state.set_state(SearchStates.waiting_for_query)
-    await message.answer("Введите название товара, который хотите найти на Wildberries.")
+    await message.answer(
+        "Введите название товара, который хотите найти на Wildberries.",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.message(SearchStates.waiting_for_query)
 async def process_query(message: Message, state: FSMContext) -> None:
     query = message.text.strip()
     if not query:
-        await message.answer("Название не может быть пустым. Попробуйте ещё раз.")
+        await message.answer(
+            "Название не может быть пустым. Попробуйте ещё раз.",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     await state.update_data(query=query)
     await state.set_state(SearchStates.waiting_for_price)
-    await message.answer("Укажите минимальную цену (в рублях). Например: 1500")
+    await message.answer(
+        "Укажите минимальную цену (в рублях). Например: 1500",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.message(SearchStates.waiting_for_price)
@@ -50,7 +60,10 @@ async def process_price(
         if min_price < 0:
             raise ValueError
     except ValueError:
-        await message.answer("Не удалось понять цену. Введите число, например 999.99")
+        await message.answer(
+            "Не удалось понять цену. Введите число, например 999.99",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     data = await state.get_data()
@@ -68,15 +81,22 @@ async def process_price(
         )
     except httpx.HTTPError:
         await message.answer(
-            "Не удалось получить данные от Wildberries. Попробуйте позже или измените запрос."
+            "Не удалось получить данные от Wildberries. Попробуйте позже или измените запрос.",
+            parse_mode=ParseMode.HTML,
         )
         await state.clear()
         return
 
     if not products:
-        await message.answer("Товары по указанным фильтрам не найдены.")
+        await message.answer(
+            "Товары по указанным фильтрам не найдены.",
+            parse_mode=ParseMode.HTML,
+        )
     else:
-        await message.answer(f"Найдено товаров: {len(products)}")
+        await message.answer(
+            f"Найдено товаров: {len(products)}",
+            parse_mode=ParseMode.HTML,
+        )
         for idx, product in enumerate(products, start=1):
             caption_lines = [
                 f"<b>{idx}. {product.name}</b>",
@@ -120,12 +140,16 @@ async def process_price(
 
             if product.photo_url:
                 try:
-                    await message.answer_photo(product.photo_url, caption=caption)
+                    await message.answer_photo(
+                        product.photo_url,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML,
+                    )
                     continue
                 except TelegramBadRequest:
                     # Fall back to text message if photo URL is invalid
                     pass
 
-            await message.answer(caption)
+            await message.answer(caption, parse_mode=ParseMode.HTML)
 
     await state.clear()
