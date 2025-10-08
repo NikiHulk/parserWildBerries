@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Mapping
+from typing import Any, Iterable, List, Mapping, Sequence
 
 import httpx
 
@@ -44,52 +44,71 @@ class WildberriesClient:
         limit: int = 10,
         exclude_words: Iterable[str] | None = None,
     ) -> List[Product]:
-        params = {
-            "query": query,
-            "limit": limit,
-            "resultset": "catalog",
-            "sort": "rate",
-            "page": 1,
-        }
+        if limit <= 0:
+            return []
 
         normalized_excludes = [word.strip().lower() for word in (exclude_words or []) if word.strip()]
+        max_candidates = max(limit * 3, limit or 1)
+        max_pages = 5
 
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.get(API_URL, params=params)
-            response.raise_for_status()
-            payload = response.json()
-
-        products_data: Iterable[dict[str, Any]] = payload.get("data", {}).get("products", [])
-        products: List[Product] = []
+        candidates: list[dict[str, Any]] = []
         min_price_units = int(min_price * 100)
 
-        filtered: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            page = 1
+            while len(candidates) < max_candidates and page <= max_pages:
+                params = {
+                    "query": query,
+                    "limit": 100,
+                    "resultset": "catalog",
+                    "sort": "rate",
+                    "page": page,
+                }
 
-        for item in products_data:
-            sale_price = item.get("salePriceU")
-            if sale_price is None or sale_price < min_price_units:
-                continue
+                response = await client.get(API_URL, params=params)
+                response.raise_for_status()
+                payload = response.json()
 
-            product_id = item.get("id")
-            if product_id is None:
-                continue
+                products_data: Iterable[dict[str, Any]] = payload.get("data", {}).get("products", [])
+                if not products_data:
+                    break
 
-            name_text = str(item.get("name", "")).lower()
-            brand_text = str(item.get("brand", "")).lower()
-            if normalized_excludes and any(
-                word in name_text or word in brand_text for word in normalized_excludes
+                for item in products_data:
+                    if not self._passes_basic_filters(item, min_price_units, normalized_excludes):
+                        continue
+                    candidates.append(item)
+                    if len(candidates) >= max_candidates:
+                        break
+
+                page += 1
+
+        products: List[Product] = []
+        detail_map = await self._fetch_details(int(item["id"]) for item in candidates)
+
+        for item in candidates:
+            product_id = int(item["id"])
+            detail = detail_map.get(product_id, {})
+            features = self._extract_features(detail)
+
+            if normalized_excludes and self._contains_in_detail(
+                normalized_excludes, item, detail, features
             ):
                 continue
 
-            filtered.append(item)
+            stock = self._extract_stock(detail)
+            registration = self._extract_registration(detail)
+            products.append(
+                self._build_product(
+                    item,
+                    detail,
+                    features=features,
+                    stock=stock,
+                    registration=registration,
+                )
+            )
 
-        limited_items = filtered[:limit]
-        detail_map = await self._fetch_details(int(item["id"]) for item in limited_items)
-
-        for item in limited_items:
-            product_id = int(item["id"])
-            detail = detail_map.get(product_id, {})
-            products.append(self._build_product(item, detail))
+            if len(products) >= limit:
+                break
 
         return products
 
@@ -113,7 +132,15 @@ class WildberriesClient:
         details = payload.get("data", {}).get("products", [])
         return {int(item.get("id")): item for item in details if item.get("id") is not None}
 
-    def _build_product(self, base: Mapping[str, Any], detail: Mapping[str, Any]) -> Product:
+    def _build_product(
+        self,
+        base: Mapping[str, Any],
+        detail: Mapping[str, Any],
+        *,
+        features: Sequence[str] | None = None,
+        stock: int | None = None,
+        registration: str | None = None,
+    ) -> Product:
         product_id = int(base.get("id", detail.get("id", 0)))
         sale_price = self._price_to_rub(base.get("salePriceU"))
         wallet_price = self._price_to_rub(
@@ -136,8 +163,10 @@ class WildberriesClient:
         rating = self._safe_float(detail.get("reviewRating") or base.get("reviewRating"))
         reviews = self._safe_int(detail.get("feedbacks") or base.get("feedbacks"))
 
-        features = self._extract_features(detail)
-        stock = self._extract_stock(detail)
+        if features is None:
+            features = self._extract_features(detail)
+        if stock is None:
+            stock = self._extract_stock(detail)
 
         seller_name = str(
             detail.get("supplierName")
@@ -154,7 +183,8 @@ class WildberriesClient:
             or base.get("supplierOrders")
             or base.get("supplierGoodsCount")
         )
-        registration = self._extract_registration(detail)
+        if registration is None:
+            registration = self._extract_registration(detail)
 
         return Product(
             id=product_id,
@@ -176,6 +206,75 @@ class WildberriesClient:
             url=f"https://www.wildberries.ru/catalog/{product_id}/detail.aspx",
             photo_url=self._extract_photo(detail, product_id),
         )
+
+    @staticmethod
+    def _passes_basic_filters(
+        item: Mapping[str, Any],
+        min_price_units: int,
+        excludes: list[str],
+    ) -> bool:
+        sale_price = item.get("salePriceU")
+        if sale_price is None or sale_price < min_price_units:
+            return False
+
+        if item.get("id") is None:
+            return False
+
+        if excludes:
+            name_text = str(item.get("name", "")).lower()
+            brand_text = str(item.get("brand", "")).lower()
+            haystack = f"{name_text} {brand_text}".strip()
+            if WildberriesClient._contains_words(excludes, [haystack]):
+                return False
+
+        return True
+
+    @staticmethod
+    def _contains_in_detail(
+        excludes: list[str],
+        base: Mapping[str, Any],
+        detail: Mapping[str, Any],
+        features: Sequence[str],
+    ) -> bool:
+        texts: list[str] = [
+            str(base.get("name", "")),
+            str(base.get("brand", "")),
+            str(detail.get("name", "")),
+            str(detail.get("brand", "")),
+            str(detail.get("description", "")),
+            str(detail.get("supplierName", "")),
+            str(detail.get("supplier", "")),
+            str(detail.get("subjectName", "")),
+            str(detail.get("subj_root_name", "")),
+            str(detail.get("root", "")),
+        ]
+
+        extended = detail.get("extended")
+        if isinstance(extended, Mapping):
+            texts.append(str(extended.get("promoTextCard", "")))
+
+        options = detail.get("options") or detail.get("characteristics")
+        if isinstance(options, list):
+            for option in options:
+                if isinstance(option, Mapping):
+                    texts.append(str(option.get("name", "")))
+                    texts.append(str(option.get("value", "")))
+                else:
+                    texts.append(str(option))
+
+        tags = detail.get("tags")
+        if isinstance(tags, list):
+            for tag in tags:
+                texts.append(str(tag))
+
+        texts.extend(str(feature) for feature in features)
+
+        return WildberriesClient._contains_words(excludes, texts)
+
+    @staticmethod
+    def _contains_words(words: Sequence[str], texts: Sequence[str]) -> bool:
+        normalized_text = " ".join(str(text).lower() for text in texts if text)
+        return any(word in normalized_text for word in words)
 
     @staticmethod
     def _price_to_rub(value: Any) -> float | None:
