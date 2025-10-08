@@ -40,6 +40,16 @@ class Database:
                 """
             )
 
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS banned_words (
+                    user_id INTEGER NOT NULL,
+                    word TEXT NOT NULL,
+                    UNIQUE(user_id, word)
+                );
+                """
+            )
+
     def upsert_subscription(
         self, user_id: int, plan: str, expires_at: Optional[datetime]
     ) -> None:
@@ -67,3 +77,36 @@ class Database:
             return None
 
         return {"plan": row["plan"], "expires_at": row["expires_at"]}
+
+    def list_banned_words(self, user_id: int) -> list[str]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT word FROM banned_words WHERE user_id = ? ORDER BY LOWER(word)",
+                (user_id,),
+            ).fetchall()
+
+        return [row["word"] for row in rows]
+
+    def add_banned_word(self, user_id: int, word: str) -> bool:
+        with self.connect() as connection:
+            try:
+                connection.execute(
+                    "INSERT OR IGNORE INTO banned_words (user_id, word) VALUES (?, ?)",
+                    (user_id, word),
+                )
+            except sqlite3.Error:
+                return False
+
+            changes = connection.total_changes
+
+        return changes > 0
+
+    def remove_banned_word(self, user_id: int, word: str) -> bool:
+        with self.connect() as connection:
+            connection.execute(
+                "DELETE FROM banned_words WHERE user_id = ? AND word = ?",
+                (user_id, word),
+            )
+            changes = connection.total_changes
+
+        return changes > 0
