@@ -7,30 +7,22 @@ from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 
 from .config import get_settings
-from .handlers import filters, search, subscription
+from .handlers import filters, search
 from .middlewares.subscription import SubscriptionMiddleware
 from .services.banned_words import BannedWordsService
-from .services.payments import PaymentService
-from .services.subscription import SubscriptionService
 from .storage.database import Database
 
 logging.basicConfig(level=logging.INFO)
 
 
-def _build_dispatcher(
-    subscription_service: SubscriptionService,
-    banned_words: BannedWordsService,
-    payments: PaymentService,
-) -> Dispatcher:
+def _build_dispatcher(banned_words: BannedWordsService) -> Dispatcher:
     dp = Dispatcher()
     dp.update.outer_middleware(
         SubscriptionMiddleware(
-            subscription_service,
-            banned_words,
-            payments,
+            banned_words=banned_words,
+            # Для возврата платной модели передайте service=SubscriptionService(...) и payments=PaymentService(...)
         )
     )
-    dp.include_router(subscription.router)
     dp.include_router(filters.router)
     dp.include_router(search.router)
     return dp
@@ -41,19 +33,10 @@ async def main() -> None:
     bot = Bot(settings.telegram_token, parse_mode=ParseMode.HTML)
     database = Database(settings.database_url)
     database.migrate()
-    subscription_service = SubscriptionService(database)
     banned_words_service = BannedWordsService(database)
-    payment_service = PaymentService(
-        shop_id=settings.yookassa_shop_id,
-        secret_key=settings.yookassa_secret_key,
-        return_url=settings.yookassa_return_url,
-        database=database,
-    )
 
     dispatcher = _build_dispatcher(
-        subscription_service,
         banned_words_service,
-        payment_service,
     )
     await dispatcher.start_polling(bot)
 

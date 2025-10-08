@@ -10,7 +10,6 @@ from aiogram.exceptions import TelegramBadRequest
 
 from ..config import get_settings
 from ..services.banned_words import BannedWordsService
-from ..services.subscription import SubscriptionService
 from ..services.wildberries import WildberriesClient
 
 router = Router()
@@ -21,21 +20,8 @@ class SearchStates(StatesGroup):
     waiting_for_price = State()
 
 
-async def _ensure_subscription(message: Message, subscription: SubscriptionService) -> bool:
-    if subscription.has_active_subscription(message.from_user.id):
-        return True
-
-    await message.answer(
-        "Поиск доступен только для активных подписчиков. Используйте команду /subscribe, чтобы оформить подписку."
-    )
-    return False
-
-
 @router.message(Command("search"))
-async def search_command(message: Message, state: FSMContext, subscription: SubscriptionService) -> None:
-    if not await _ensure_subscription(message, subscription):
-        return
-
+async def search_command(message: Message, state: FSMContext) -> None:
     await state.set_state(SearchStates.waiting_for_query)
     await message.answer("Введите название товара, который хотите найти на Wildberries.")
 
@@ -56,7 +42,6 @@ async def process_query(message: Message, state: FSMContext) -> None:
 async def process_price(
     message: Message,
     state: FSMContext,
-    subscription: SubscriptionService,
     banned_words: BannedWordsService,
 ) -> None:
     text = message.text.replace(",", ".")

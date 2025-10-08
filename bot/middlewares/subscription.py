@@ -9,9 +9,11 @@ from ..services.subscription import SubscriptionService
 
 
 class SubscriptionMiddleware(BaseMiddleware):
+    """Inject shared services into handler data."""
+
     def __init__(
         self,
-        service: SubscriptionService,
+        service: SubscriptionService | None = None,
         banned_words: BannedWordsService | None = None,
         payments: PaymentService | None = None,
     ) -> None:
@@ -21,7 +23,8 @@ class SubscriptionMiddleware(BaseMiddleware):
         self._payments = payments
 
     async def __call__(self, handler, event: TelegramObject, data: dict):  # type: ignore[override]
-        data.setdefault("subscription", self._service)
+        if self._service is not None:
+            data.setdefault("subscription", self._service)
         if self._banned_words is not None:
             data.setdefault("banned_words", self._banned_words)
         if self._payments is not None:
