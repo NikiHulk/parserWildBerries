@@ -4,6 +4,7 @@ import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from .config import get_settings
@@ -30,7 +31,10 @@ def _build_dispatcher(banned_words: BannedWordsService) -> Dispatcher:
 
 async def main() -> None:
     settings = get_settings()
-    bot = Bot(settings.telegram_token, parse_mode=ParseMode.HTML)
+    bot = Bot(
+        settings.telegram_token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
     database = Database(settings.database_url)
     database.migrate()
     banned_words_service = BannedWordsService(database)
