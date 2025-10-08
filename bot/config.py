@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -27,12 +27,13 @@ class Settings(BaseSettings):
         env="YOOKASSA_RETURN_URL",
     )
 
-    model_config = {
-        "env_file": ".env",
-        "env_file_encoding": "utf-8",
-    }
+    model_config = SettingsConfigDict(env_file_encoding="utf-8")
 
 
 @lru_cache()
 def get_settings() -> Settings:
-    return Settings()
+    env_file = Path(".env")
+    kwargs = {}
+    if env_file.exists():
+        kwargs["_env_file"] = env_file
+    return Settings(**kwargs)
