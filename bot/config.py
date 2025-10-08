@@ -17,6 +17,15 @@ class Settings(BaseSettings):
     )
     request_timeout: float = Field(default=10.0, env="REQUEST_TIMEOUT")
     max_results: int = Field(default=10, env="MAX_RESULTS")
+    yookassa_shop_id: str | None = Field(default=None, env="YOOKASSA_SHOP_ID")
+    yookassa_secret_key: str | None = Field(
+        default=None,
+        env="YOOKASSA_SECRET_KEY",
+    )
+    yookassa_return_url: str | None = Field(
+        default=None,
+        env="YOOKASSA_RETURN_URL",
+    )
 
     model_config = {
         "env_file": ".env",

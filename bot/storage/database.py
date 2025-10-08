@@ -50,6 +50,18 @@ class Database:
                 """
             )
 
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS payments (
+                    payment_id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    plan TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+
     def upsert_subscription(
         self, user_id: int, plan: str, expires_at: Optional[datetime]
     ) -> None:
@@ -100,6 +112,60 @@ class Database:
             changes = connection.total_changes
 
         return changes > 0
+
+    def add_payment(
+        self,
+        *,
+        payment_id: str,
+        user_id: int,
+        plan: str,
+        status: str,
+        created_at: datetime,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO payments (
+                    payment_id, user_id, plan, status, created_at
+                ) VALUES (:payment_id, :user_id, :plan, :status, :created_at)
+                """,
+                {
+                    "payment_id": payment_id,
+                    "user_id": user_id,
+                    "plan": plan,
+                    "status": status,
+                    "created_at": created_at.isoformat(),
+                },
+            )
+
+    def update_payment_status(self, payment_id: str, status: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE payments SET status = ? WHERE payment_id = ?",
+                (status, payment_id),
+            )
+
+    def get_payment(self, payment_id: str) -> Optional[dict[str, Optional[str]]]:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT payment_id, user_id, plan, status, created_at
+                FROM payments
+                WHERE payment_id = ?
+                """,
+                (payment_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return {
+            "payment_id": row["payment_id"],
+            "user_id": str(row["user_id"]),
+            "plan": row["plan"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+        }
 
     def remove_banned_word(self, user_id: int, word: str) -> bool:
         with self.connect() as connection:

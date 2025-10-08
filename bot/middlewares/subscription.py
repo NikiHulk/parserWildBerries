@@ -4,6 +4,7 @@ from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject
 
 from ..services.banned_words import BannedWordsService
+from ..services.payments import PaymentService
 from ..services.subscription import SubscriptionService
 
 
@@ -12,13 +13,17 @@ class SubscriptionMiddleware(BaseMiddleware):
         self,
         service: SubscriptionService,
         banned_words: BannedWordsService | None = None,
+        payments: PaymentService | None = None,
     ) -> None:
         super().__init__()
         self._service = service
         self._banned_words = banned_words
+        self._payments = payments
 
     async def __call__(self, handler, event: TelegramObject, data: dict):  # type: ignore[override]
         data.setdefault("subscription", self._service)
         if self._banned_words is not None:
             data.setdefault("banned_words", self._banned_words)
+        if self._payments is not None:
+            data.setdefault("payments", self._payments)
         return await handler(event, data)

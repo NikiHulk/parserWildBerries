@@ -12,12 +12,28 @@ class SubscriptionPlan:
     name: str
     duration_days: int
     description: str
+    price_rub: int
 
 
 DEFAULT_PLANS = {
-    "trial": SubscriptionPlan("trial", 7, "Бесплатный пробный период на 7 дней."),
-    "monthly": SubscriptionPlan("monthly", 30, "Месячная подписка для расширенного поиска."),
-    "annual": SubscriptionPlan("annual", 365, "Годовая подписка с максимальными возможностями."),
+    "trial": SubscriptionPlan(
+        "trial",
+        7,
+        "Бесплатный пробный период на 7 дней.",
+        price_rub=0,
+    ),
+    "monthly": SubscriptionPlan(
+        "monthly",
+        30,
+        "Месячная подписка для расширенного поиска.",
+        price_rub=1490,
+    ),
+    "annual": SubscriptionPlan(
+        "annual",
+        365,
+        "Годовая подписка с максимальными возможностями.",
+        price_rub=14990,
+    ),
 }
 
 
@@ -41,6 +57,12 @@ class SubscriptionService:
         expires_at = datetime.utcnow() + timedelta(days=duration)
         self._db.upsert_subscription(user_id, plan_name, expires_at)
         return expires_at
+
+    def get_plan(self, plan_name: str) -> SubscriptionPlan:
+        try:
+            return DEFAULT_PLANS[plan_name]
+        except KeyError as exc:  # pragma: no cover - defensive branch
+            raise ValueError("Неизвестный план подписки") from exc
 
     def has_active_subscription(self, user_id: int) -> bool:
         data = self._db.get_subscription(user_id)

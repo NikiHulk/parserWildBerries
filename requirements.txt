@@ -3,3 +3,4 @@ httpx>=0.25
 pydantic>=2.6
 pydantic-settings>=2.1
 python-dotenv>=1.0
+yookassa>=3.0
