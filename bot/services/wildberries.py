@@ -36,7 +36,7 @@ HEADERS = {
 
 COOKIE_TTL_SECONDS = 6 * 60 * 60
 COOKIE_FILE = Path("data/wb_cookies.json")
-PLAYWRIGHT_STORAGE_FILE = Path("/data/pw-storage.json")
+PLAYWRIGHT_STORAGE_FILE = Path("/app/data/wb_playwright_state.json")
 HTML_SETTLE_MS = 800
 
 START_LIMIT = 20
@@ -211,6 +211,7 @@ class WildberriesClient:
         self._browser_context = None
         self._browser_lock = asyncio.Lock()
         self._html_context_user_agent: str | None = None
+        self._last_html_ok = False
 
     @staticmethod
     def _detect_http2_support() -> bool:
@@ -634,6 +635,8 @@ class WildberriesClient:
                 "locale": "ru-RU",
                 "java_script_enabled": True,
                 "viewport": {"width": 1366, "height": 768},
+                "timezone_id": "Europe/Moscow",
+                "permissions": ["geolocation"],
                 "extra_http_headers": {
                     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
                     "Cache-Control": "no-cache",
@@ -650,6 +653,17 @@ class WildberriesClient:
                 logger.info("[WB/Playwright] Запуск нового браузерного контекста")
 
             self._browser_context = await self._browser.new_context(**context_kwargs)
+            try:
+                await self._browser_context.add_init_script(
+                    """
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    window.chrome = { runtime: {} };
+                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+                    Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU', 'ru'] });
+                    """
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[WB/Playwright] Не удалось добавить антидетект-скрипт: %s", exc)
             self._html_context_user_agent = user_agent
 
             if storage_state_arg:
@@ -1081,9 +1095,14 @@ class WildberriesClient:
         force_refresh = False
         attempt = 0
         max_attempts = 6
+        slow_mode_next = False
+        pre_attempt_delay = 0.0
 
         while attempt < max_attempts:
             attempt += 1
+            if pre_attempt_delay > 0:
+                await asyncio.sleep(pre_attempt_delay)
+                pre_attempt_delay = 0.0
             try:
                 context = await self._ensure_browser_context(force_refresh=force_refresh)
             except Exception as exc:  # noqa: BLE001
@@ -1094,15 +1113,23 @@ class WildberriesClient:
 
             force_refresh = False
             context_used = context
+            slow_mode = slow_mode_next
+            slow_mode_next = False
             page_obj = await context.new_page()
-            page_obj.set_default_navigation_timeout(30000)
+            page_obj.set_default_navigation_timeout(45000 if slow_mode else 30000)
             page_obj.set_default_timeout(15000)
 
             responses: list[dict[str, Any]] = []
+            links_list: list[str] = []
+            self._last_html_ok = False
+            last_status: int | None = None
+            should_retry = False
 
-            async def on_response(resp) -> None:  # type: ignore[no-untyped-def]
+            async def capture_response(resp) -> None:  # type: ignore[no-untyped-def]
                 try:
                     url_value = resp.url
+                    if url_value.startswith("https://www.wildberries.ru/catalog/") and resp.status == 200:
+                        self._last_html_ok = True
                     if not (
                         ("search" in url_value or "catalog" in url_value)
                         and (
@@ -1112,29 +1139,49 @@ class WildberriesClient:
                         )
                     ):
                         return
-                    headers_map = resp.headers or {}
-                    content_type = headers_map.get("content-type", "")
+                    content_type = (resp.headers or {}).get("content-type", "")
                     if resp.status == 200 and "application/json" in content_type:
-                        payload = await resp.json()
-                        data = payload.get("data") if isinstance(payload, Mapping) else None
-                        products = data.get("products") if isinstance(data, Mapping) else None
-                        if isinstance(products, Sequence) and products:
-                            responses.append(payload)
+                        data = await resp.json()
+                        if (
+                            isinstance(data, Mapping)
+                            and isinstance(data.get("data"), Mapping)
+                            and isinstance(data["data"].get("products"), Sequence)
+                            and data["data"]["products"]
+                        ):
+                            responses.append(data)
                 except Exception:  # noqa: BLE001
                     pass
 
-            page_obj.on("response", on_response)
-            should_retry = False
-            last_status: int | None = None
+            page_obj.on("response", capture_response)
 
             try:
-                goto_response = await page_obj.goto(
-                    html_url,
-                    wait_until="networkidle",
-                    timeout=30000,
-                )
-                if goto_response is not None:
-                    last_status = goto_response.status
+                goto_response = None
+                if slow_mode:
+                    for _ in range(3):
+                        try:
+                            goto_response = await page_obj.goto(
+                                html_url,
+                                wait_until="load",
+                                timeout=45000,
+                            )
+                            if goto_response is not None:
+                                last_status = goto_response.status
+                            if goto_response and goto_response.status == 200:
+                                break
+                            await page_obj.wait_for_timeout(random.uniform(5000, 7000))
+                        except PlaywrightTimeoutError:
+                            await page_obj.wait_for_timeout(random.uniform(3000, 5000))
+                        except Exception:
+                            await page_obj.wait_for_timeout(random.uniform(3000, 5000))
+                else:
+                    goto_response = await page_obj.goto(
+                        html_url,
+                        wait_until="networkidle",
+                        timeout=30000,
+                    )
+                    if goto_response is not None:
+                        last_status = goto_response.status
+
                 if goto_response and goto_response.status in {403, 498}:
                     logger.warning(
                         "[WB/Playwright] Ответ %s на HTML-странице, пробуем обновить контекст",
@@ -1142,19 +1189,25 @@ class WildberriesClient:
                     )
                     should_retry = True
                 else:
+                    await page_obj.wait_for_timeout(random.uniform(4000, 6000))
                     try:
                         await page_obj.wait_for_selector("input#searchInput", timeout=5000)
                     except Exception:  # noqa: BLE001
                         pass
-
-                    await page_obj.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await page_obj.wait_for_timeout(1500)
                     try:
-                        await page_obj.mouse.move(100, 100)
-                        await page_obj.mouse.wheel(0, 600)
+                        await page_obj.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     except Exception:  # noqa: BLE001
                         pass
-                    await page_obj.wait_for_timeout(2000)
+                    await page_obj.wait_for_timeout(1500)
+                    try:
+                        await page_obj.mouse.move(150, 150)
+                        await page_obj.mouse.wheel(0, 800)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    await page_obj.wait_for_timeout(random.uniform(2000, 3500))
+
+                    if self._last_html_ok:
+                        logger.info("[WB/Playwright] Challenge пройден, загрузка каталога OK")
 
                     logger.info("[WB/Playwright] JSON XHR найден: %s", len(responses))
 
@@ -1174,6 +1227,7 @@ class WildberriesClient:
                             collected.append(nm_id)
 
                     nm_ids = list(dict.fromkeys(collected))
+                    dom_ids: list[int] = []
                     if nm_ids:
                         source = "html_xhr"
                     else:
@@ -1185,33 +1239,38 @@ class WildberriesClient:
                         except Exception:  # noqa: BLE001
                             pass
 
-                        links = await page_obj.eval_on_selector_all(
-                            'a[href*="/catalog/"][href$="/detail.aspx"]',
-                            "els => els.map(a => a.href)",
-                        )
-                        links_count = len(links) if isinstance(links, Sequence) else 0
-                        logger.info(
-                            "[WB/Playwright] JS-инициализация завершена, карточек в DOM: %s",
-                            links_count,
-                        )
+                        try:
+                            raw_links = await page_obj.eval_on_selector_all(
+                                'a[href*="/catalog/"][href$="/detail.aspx"]',
+                                'els => els.map(a => a.href)',
+                            )
+                        except Exception:
+                            raw_links = []
 
-                        dom_ids: list[int] = []
-                        if isinstance(links, Sequence):
-                            for link in links:
-                                if not isinstance(link, str):
-                                    continue
-                                match = re.search(r"/catalog/(\d+)/detail\.aspx", link)
-                                if not match:
-                                    continue
-                                try:
-                                    dom_ids.append(int(match.group(1)))
-                                except (TypeError, ValueError):
-                                    continue
+                        links_list = [
+                            link for link in raw_links if isinstance(link, str)
+                        ]
+
+                        for link in links_list:
+                            match = re.search(r"/catalog/(\d+)/detail\.aspx", link)
+                            if not match:
+                                continue
+                            try:
+                                dom_ids.append(int(match.group(1)))
+                            except (TypeError, ValueError):
+                                continue
                         if dom_ids:
-                            nm_ids = list(dict.fromkeys(dom_ids))
+                            dom_ids = list(dict.fromkeys(dom_ids))
+                            nm_ids = dom_ids
                             source = "html_dom"
                         else:
                             nm_ids = []
+
+                    logger.info(
+                        "[WB/Playwright] DOM карточек: %s, XHR карточек: %s",
+                        len(links_list),
+                        len(responses),
+                    )
             except PlaywrightTimeoutError as exc:
                 logger.warning("[WB/Playwright] Таймаут на HTML-странице: %s", exc)
                 should_retry = True
@@ -1220,7 +1279,7 @@ class WildberriesClient:
                 should_retry = True
             finally:
                 try:
-                    page_obj.off("response", on_response)
+                    page_obj.off("response", capture_response)
                 except Exception:  # noqa: BLE001
                     pass
                 try:
@@ -1241,10 +1300,12 @@ class WildberriesClient:
                             await context_used.clear_permissions()
                         except Exception:  # noqa: BLE001
                             pass
-                    await asyncio.sleep(random.uniform(1.2, 2.4))
+                    await asyncio.sleep(random.uniform(2.0, 4.0))
                     await self._close_browser_context_locked()
                     context_used = None
                     force_refresh = True
+                    slow_mode_next = True
+                    pre_attempt_delay = random.uniform(2.0, 4.0)
                     consecutive_498 = 0
                 else:
                     await asyncio.sleep(random.uniform(0.6, 1.2))
