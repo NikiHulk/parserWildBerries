@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import logging
 from dataclasses import dataclass
@@ -11,9 +12,6 @@ logger = logging.getLogger(__name__)
 
 API_URL = "https://search.wb.ru/exactmatch/ru/common/v4/search"
 DETAIL_API_URL = "https://card.wb.ru/cards/detail"
-# Верхний предел для серверного фильтра по цене (10 млн ₽ в копейках).
-MAX_PRICE_LIMIT_UNITS = 1_000_000_000
-
 DEFAULT_SEARCH_PARAMS = {
     "appType": 1,
     "curr": "rub",
@@ -48,7 +46,7 @@ class Product:
     seller_orders: int | None
     seller_registration: str | None
     url: str
-    photo_url: str | None
+    image_url: str | None
 
 
 class WildberriesClient:
@@ -85,71 +83,160 @@ class WildberriesClient:
             return False
         return True
 
-    async def search(
+    async def search_products(
         self,
         query: str,
-        min_price: float = 0.0,
-        max_price: float | None = None,
-        limit: int = 10,
-        exclude_words: Iterable[str] | None = None,
+        min_price: int | None,
+        max_price: int | None,
+        banned_words: list[str],
+        max_results: int,
+        timeout: int,
     ) -> List[Product]:
-        if limit <= 0:
+        if max_results <= 0:
             return []
 
-        normalized_excludes = [word.strip().lower() for word in (exclude_words or []) if word.strip()]
-        max_candidates = max(limit * 5, limit or 1)
-        max_pages = 10
+        min_price_rub = max(min_price or 0, 0) if min_price is not None else None
+        max_price_rub = max_price if max_price not in (None, 0) else None
 
-        min_price_units = int(min_price * 100)
-        max_price_units = int(max_price * 100) if max_price is not None else None
+        if max_price_rub is not None and max_price_rub < 0:
+            max_price_rub = None
+
+        if (
+            min_price_rub is not None
+            and max_price_rub is not None
+            and min_price_rub > max_price_rub
+        ):
+            min_price_rub, max_price_rub = max_price_rub, min_price_rub
+
+        normalized_banned = [
+            word.strip().lower()
+            for word in banned_words
+            if isinstance(word, str) and word.strip()
+        ]
+
+        filtered_items: list[dict[str, Any]] = []
+        filtered_by_price = 0
+        filtered_by_banned = 0
+        total_received = 0
+
+        effective_timeout = float(timeout or self._timeout)
 
         async with httpx.AsyncClient(
-            timeout=self._timeout,
+            timeout=effective_timeout,
             headers=self._headers,
             follow_redirects=True,
             http2=self._http2_enabled,
         ) as client:
-            candidates = await self._collect_candidates(
-                client,
-                query=query,
-                min_price_units=min_price_units,
-                max_price_units=max_price_units,
-                max_candidates=max_candidates,
-                max_pages=max_pages,
-                excludes=normalized_excludes,
-                use_price_filter=(min_price_units > 0 or max_price_units is not None),
-            )
+            page = 1
 
-            if not candidates and (min_price_units > 0 or max_price_units is not None):
+            while len(filtered_items) < max_results:
+                params = {
+                    "query": query,
+                    "resultset": "catalog",
+                    "limit": 100,
+                    "page": page,
+                }
+                params.update(DEFAULT_SEARCH_PARAMS)
+
+                response = await self._get_with_retries(client, params)
+                payload = response.json()
+
+                products_data: Iterable[dict[str, Any]] = (
+                    payload.get("data", {}).get("products", []) or []
+                )
+                total_received += len(products_data)
+
                 logger.info(
-                    "Серверный фильтр priceU не вернул товаров, повторяем поиск без него"
+                    "WB поиск: %s -> статус %s, товаров на странице: %s",
+                    response.request.url,
+                    response.status_code,
+                    len(products_data),
                 )
-                candidates = await self._collect_candidates(
-                    client,
-                    query=query,
-                    min_price_units=min_price_units,
-                    max_price_units=max_price_units,
-                    max_candidates=max_candidates,
-                    max_pages=max_pages,
-                    excludes=normalized_excludes,
-                    use_price_filter=False,
-                )
+
+                if products_data:
+                    first = products_data[0]
+                    logger.info(
+                        "Первая карточка: id=%s, name=%s, salePriceU=%s",
+                        first.get("id"),
+                        first.get("name"),
+                        first.get("salePriceU"),
+                    )
+
+                if not products_data:
+                    break
+
+                for item in products_data:
+                    product_id = item.get("id")
+                    if product_id is None:
+                        continue
+
+                    raw_price_units = (
+                        item.get("salePriceU")
+                        or item.get("priceU")
+                        or 0
+                    )
+                    try:
+                        price_units = int(raw_price_units)
+                    except (TypeError, ValueError):
+                        price_units = 0
+
+                    price_rub = price_units // 100
+
+                    if (
+                        min_price_rub is not None
+                        and price_rub < min_price_rub
+                    ):
+                        filtered_by_price += 1
+                        continue
+
+                    if (
+                        max_price_rub is not None
+                        and price_rub > max_price_rub
+                    ):
+                        filtered_by_price += 1
+                        continue
+
+                    if normalized_banned:
+                        haystack = f"{item.get('name', '')} {item.get('brand', '')}".lower()
+                        if any(word in haystack for word in normalized_banned):
+                            filtered_by_banned += 1
+                            continue
+
+                    filtered_items.append(item)
+
+                    if len(filtered_items) >= max_results:
+                        break
+
+                page += 1
+
+        if not filtered_items:
+            if total_received == 0:
+                reason = "пустой ответ от API"
+            elif filtered_by_price and not filtered_by_banned:
+                reason = "filtered by min/max"
+            elif filtered_by_banned and not filtered_by_price:
+                reason = "filtered by banned words"
+            elif filtered_by_price and filtered_by_banned:
+                reason = "filtered by min/max and banned words"
+            else:
+                reason = "неизвестная причина"
+
+            logger.info("После фильтрации товаров нет (%s)", reason)
+            return []
+
+        limited_items = filtered_items[:max_results]
+        detail_map = await self._fetch_details(
+            (int(item["id"]) for item in limited_items), timeout=effective_timeout
+        )
 
         products: List[Product] = []
-        detail_map = await self._fetch_details(int(item["id"]) for item in candidates)
-
-        for item in candidates:
+        for item in limited_items:
             product_id = int(item["id"])
             detail = detail_map.get(product_id, {})
             features = self._extract_features(detail)
-
-            if normalized_excludes and self._contains_in_detail(
-                normalized_excludes, item, detail, features
-            ):
-                continue
-
             stock = self._extract_stock(detail)
             registration = self._extract_registration(detail)
+
             products.append(
                 self._build_product(
                     item,
@@ -160,66 +247,43 @@ class WildberriesClient:
                 )
             )
 
-            if len(products) >= limit:
-                break
-
         return products
 
-    async def _collect_candidates(
+    async def _get_with_retries(
         self,
         client: httpx.AsyncClient,
+        params: Mapping[str, Any],
         *,
-        query: str,
-        min_price_units: int,
-        max_price_units: int | None,
-        max_candidates: int,
-        max_pages: int,
-        excludes: list[str],
-        use_price_filter: bool,
-    ) -> list[dict[str, Any]]:
-        """Получаем список карточек с учётом пагинации и фильтров."""
+        attempts: int = 3,
+    ) -> httpx.Response:
+        last_exception: Exception | None = None
 
-        candidates: list[dict[str, Any]] = []
-        page = 1
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self._perform_search_request(client, params)
+            except (httpx.ReadTimeout, httpx.ConnectError) as exc:
+                last_exception = exc
+                if attempt == attempts:
+                    raise
+                delay = 0.5 * attempt
+                logger.warning(
+                    "Ошибка сети %s при обращении к Wildberries (попытка %s/%s). "
+                    "Повтор через %.1f с",
+                    exc.__class__.__name__,
+                    attempt,
+                    attempts,
+                    delay,
+                )
+                await asyncio.sleep(delay)
 
-        while len(candidates) < max_candidates and page <= max_pages:
-            params = {
-                "query": query,
-                "limit": 100,
-                "resultset": "catalog",
-                "sort": "rate",
-                "page": page,
-            }
-            if use_price_filter:
-                upper_bound = max_price_units if max_price_units is not None else MAX_PRICE_LIMIT_UNITS
-                params["priceU"] = f"{min_price_units};{upper_bound}"
+        if last_exception is not None:
+            raise last_exception
 
-            params.update(DEFAULT_SEARCH_PARAMS)
+        raise RuntimeError("Не удалось выполнить запрос к Wildberries")
 
-            response = await self._perform_search_request(client, params)
-            payload = response.json()
-
-            products_data: Iterable[dict[str, Any]] = payload.get("data", {}).get("products", [])
-            if not products_data:
-                break
-
-            for item in products_data:
-                if not self._passes_basic_filters(
-                    item,
-                    min_price_units=min_price_units,
-                    max_price_units=max_price_units,
-                    excludes=excludes,
-                ):
-                    continue
-                candidates.append(item)
-                if len(candidates) >= max_candidates:
-                    break
-
-            page += 1
-
-        return candidates
-
-    async def _fetch_details(self, product_ids: Iterable[int]) -> Mapping[int, dict[str, Any]]:
+    async def _fetch_details(
+        self, product_ids: Iterable[int], *, timeout: float
+    ) -> Mapping[int, dict[str, Any]]:
         ids = [str(pid) for pid in product_ids]
         if not ids:
             return {}
@@ -232,7 +296,7 @@ class WildberriesClient:
         }
 
         async with httpx.AsyncClient(
-            timeout=self._timeout,
+            timeout=timeout,
             headers=self._headers,
             follow_redirects=True,
             http2=self._http2_enabled,
@@ -316,79 +380,8 @@ class WildberriesClient:
             seller_orders=seller_orders,
             seller_registration=registration,
             url=f"https://www.wildberries.ru/catalog/{product_id}/detail.aspx",
-            photo_url=self._extract_photo(detail, product_id),
+            image_url=self._extract_photo(detail, product_id),
         )
-
-    @staticmethod
-    def _passes_basic_filters(
-        item: Mapping[str, Any],
-        *,
-        min_price_units: int,
-        max_price_units: int | None,
-        excludes: list[str],
-    ) -> bool:
-        sale_price = WildberriesClient._safe_int(item.get("salePriceU"))
-        if sale_price is None:
-            sale_price = WildberriesClient._safe_int(item.get("priceU"))
-        if sale_price is None or sale_price < min_price_units:
-            return False
-
-        if max_price_units is not None and sale_price > max_price_units:
-            return False
-
-        if item.get("id") is None:
-            return False
-
-        if excludes:
-            name_text = str(item.get("name", "")).lower()
-            brand_text = str(item.get("brand", "")).lower()
-            haystack = f"{name_text} {brand_text}".strip()
-            if WildberriesClient._contains_words(excludes, [haystack]):
-                return False
-
-        return True
-
-    @staticmethod
-    def _contains_in_detail(
-        excludes: list[str],
-        base: Mapping[str, Any],
-        detail: Mapping[str, Any],
-        features: Sequence[str],
-    ) -> bool:
-        texts: list[str] = [
-            str(base.get("name", "")),
-            str(base.get("brand", "")),
-            str(detail.get("name", "")),
-            str(detail.get("brand", "")),
-            str(detail.get("description", "")),
-            str(detail.get("supplierName", "")),
-            str(detail.get("supplier", "")),
-            str(detail.get("subjectName", "")),
-            str(detail.get("subj_root_name", "")),
-            str(detail.get("root", "")),
-        ]
-
-        extended = detail.get("extended")
-        if isinstance(extended, Mapping):
-            texts.append(str(extended.get("promoTextCard", "")))
-
-        options = detail.get("options") or detail.get("characteristics")
-        if isinstance(options, list):
-            for option in options:
-                if isinstance(option, Mapping):
-                    texts.append(str(option.get("name", "")))
-                    texts.append(str(option.get("value", "")))
-                else:
-                    texts.append(str(option))
-
-        tags = detail.get("tags")
-        if isinstance(tags, list):
-            for tag in tags:
-                texts.append(str(tag))
-
-        texts.extend(str(feature) for feature in features)
-
-        return WildberriesClient._contains_words(excludes, texts)
 
     async def _perform_search_request(
         self,
@@ -422,11 +415,6 @@ class WildberriesClient:
         except httpx.HTTPError:
             logger.exception("Ошибка при обращении к поисковому API Wildberries")
             raise
-
-    @staticmethod
-    def _contains_words(words: Sequence[str], texts: Sequence[str]) -> bool:
-        normalized_text = " ".join(str(text).lower() for text in texts if text)
-        return any(word in normalized_text for word in words)
 
     @staticmethod
     def _price_to_rub(value: Any) -> float | None:
@@ -509,4 +497,12 @@ class WildberriesClient:
                             return str(path)
                         return f"https://images.wbstatic.net/{path}"
 
-        return f"https://images.wbstatic.net/big/new/{product_id // 1000}/{product_id}-1.jpg"
+        return WildberriesClient._build_image_url(product_id)
+
+    @staticmethod
+    def _build_image_url(product_id: int) -> str:
+        shard = (product_id // 100000) % 10
+        return (
+            f"https://basket-0{shard}.wbstatic.net/"
+            f"vol{product_id // 100000}/part{product_id // 1000}/{product_id}/images/big/1.jpg"
+        )

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
+
 import httpx
 from aiogram import F, Router
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.enums import ParseMode
 from aiogram.types import Message
-from aiogram.exceptions import TelegramBadRequest
 
 from ..config import get_settings
 from ..keyboards import (
@@ -20,6 +22,19 @@ from ..services.banned_words import BannedWordsService
 from ..services.wildberries import WildberriesClient
 
 router = Router()
+
+
+def _parse_price_to_int(raw_value: str) -> int:
+    cleaned = raw_value.replace(" ", "").replace("_", "").replace(",", ".")
+    try:
+        decimal_value = Decimal(cleaned)
+    except (InvalidOperation, ValueError):
+        raise ValueError from None
+
+    if decimal_value < 0:
+        raise ValueError
+
+    return int(decimal_value.quantize(Decimal("1"), rounding=ROUND_DOWN))
 
 
 class SearchStates(StatesGroup):
@@ -84,14 +99,12 @@ async def process_min_price(
         )
         return
 
-    text = (message.text or "").replace(",", ".")
+    raw_value = message.text or ""
     try:
-        min_price = float(text)
-        if min_price < 0:
-            raise ValueError
+        min_price = _parse_price_to_int(raw_value)
     except ValueError:
         await message.answer(
-            "Не удалось понять цену. Введите число, например 999.99",
+            "Не удалось понять цену. Введите целое число, например 999 или 2 000.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -122,48 +135,35 @@ async def process_max_price(
         return
 
     raw_text = (message.text or "").strip()
-    max_price: float | None
-    if not raw_text:
-        max_price = None
-    else:
-        normalized = raw_text.replace(",", ".")
-        if normalized.casefold() in {"пропустить", "skip"}:
-            max_price = None
-        else:
+    max_price: int | None = None
+    if raw_text:
+        if raw_text.casefold() not in {"пропустить", "skip"}:
             try:
-                parsed = float(normalized)
-                if parsed <= 0:
-                    max_price = None
-                else:
-                    max_price = parsed
+                parsed = _parse_price_to_int(raw_text)
             except ValueError:
                 await message.answer(
-                    "Не удалось понять максимальную цену. Введите число или 0, чтобы пропустить порог.",
+                    "Не удалось понять максимальную цену. Введите целое число или 0, чтобы пропустить порог.",
                     parse_mode=ParseMode.HTML,
                 )
                 return
+            if parsed > 0:
+                max_price = parsed
 
     data = await state.get_data()
-    query = data.get("query", "")
-    min_price = float(data.get("min_price", 0))
-
-    if max_price is not None and max_price < min_price:
-        await message.answer(
-            "Максимальная цена не может быть меньше минимальной. Попробуйте ещё раз.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
+    query = str(data.get("query", ""))
+    min_price = int(data.get("min_price", 0))
 
     settings = get_settings()
     client = WildberriesClient(timeout=settings.request_timeout)
 
     try:
-        products = await client.search(
+        products = await client.search_products(
             query=query,
             min_price=min_price,
             max_price=max_price,
-            limit=settings.max_results,
-            exclude_words=banned_words.list_words(message.from_user.id),
+            banned_words=banned_words.list_words(message.from_user.id),
+            max_results=settings.max_results,
+            timeout=settings.request_timeout,
         )
     except httpx.HTTPError:
         await message.answer(
@@ -225,10 +225,10 @@ async def process_max_price(
 
             caption = "\n".join(caption_lines)
 
-            if product.photo_url:
+            if product.image_url:
                 try:
                     await message.answer_photo(
-                        product.photo_url,
+                        product.image_url,
                         caption=caption,
                         parse_mode=ParseMode.HTML,
                     )
