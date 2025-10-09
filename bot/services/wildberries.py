@@ -300,6 +300,11 @@ class WildberriesClient:
             reverse=True,
         )
 
+        logger.info(
+            "После фильтрации: %s товаров (reason=success)",
+            len(filtered_candidates),
+        )
+
         limited_candidates = filtered_candidates[:max_results]
         detail_map = await self._fetch_details(
             (int(candidate["item"]["id"]) for candidate in limited_candidates),

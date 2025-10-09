@@ -18,9 +18,11 @@ from bot.config import get_settings
 from bot.services.wildberries import WildberriesClient
 
 
-def _parse_price(value: str | None) -> int | None:
+def _parse_price(value: str | int | None) -> int | None:
     if value is None:
         return None
+    if isinstance(value, int):
+        return value if value > 0 else None
     cleaned = value.strip().replace(" ", "").replace("_", "").replace(",", ".")
     if not cleaned:
         return None
@@ -83,18 +85,18 @@ def parse_args() -> argparse.Namespace:
         description="Проверка поискового клиента Wildberries",
     )
     parser.add_argument("--query", required=True, help="поисковый запрос")
-    parser.add_argument("--min", default=None, help="минимальная цена в рублях")
-    parser.add_argument("--max", default=None, help="максимальная цена в рублях")
+    parser.add_argument("--min", type=int, default=None)
+    parser.add_argument("--max", type=int, default=None)
     parser.add_argument(
         "--limit",
         type=int,
-        default=None,
+        default=10,
         help="количество результатов",
     )
     parser.add_argument(
         "--banned",
         nargs="*",
-        default=None,
+        default=[],
         help="список стоп-слов, которые нужно исключить",
     )
     return parser.parse_args()
