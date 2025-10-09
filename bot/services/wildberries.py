@@ -8,6 +8,16 @@ import httpx
 API_URL = "https://search.wb.ru/exactmatch/ru/common/v4/search"
 DETAIL_API_URL = "https://card.wb.ru/cards/detail"
 
+DEFAULT_SEARCH_PARAMS = {
+    "appType": 1,
+    "curr": "rub",
+    "dest": -1257786,
+    "regions": (
+        "80,64,38,4,115,83,33,68,70,86,75,30,40,48,69,22,66,31,1,114"
+    ),
+    "spp": 0,
+}
+
 
 @dataclass(slots=True)
 class Product:
@@ -34,8 +44,17 @@ class Product:
 class WildberriesClient:
     """Client for fetching products from Wildberries search API."""
 
-    def __init__(self, timeout: float = 10.0) -> None:
+    def __init__(self, timeout: float = 10.0, *, user_agent: str | None = None) -> None:
         self._timeout = timeout
+        self._headers = {
+            "User-Agent": user_agent
+            or (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            ),
+            "Accept": "application/json",
+        }
 
     async def search(
         self,
@@ -54,7 +73,7 @@ class WildberriesClient:
         candidates: list[dict[str, Any]] = []
         min_price_units = int(min_price * 100)
 
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        async with httpx.AsyncClient(timeout=self._timeout, headers=self._headers) as client:
             page = 1
             while len(candidates) < max_candidates and page <= max_pages:
                 params = {
@@ -64,6 +83,7 @@ class WildberriesClient:
                     "sort": "rate",
                     "page": page,
                 }
+                params.update(DEFAULT_SEARCH_PARAMS)
 
                 response = await client.get(API_URL, params=params)
                 response.raise_for_status()
@@ -124,7 +144,7 @@ class WildberriesClient:
             "nm": ",".join(ids),
         }
 
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        async with httpx.AsyncClient(timeout=self._timeout, headers=self._headers) as client:
             response = await client.get(DETAIL_API_URL, params=params)
             response.raise_for_status()
             payload = response.json()
@@ -213,9 +233,9 @@ class WildberriesClient:
         min_price_units: int,
         excludes: list[str],
     ) -> bool:
-        sale_price = item.get("salePriceU")
+        sale_price = WildberriesClient._safe_int(item.get("salePriceU"))
         if sale_price is None:
-            sale_price = item.get("priceU")
+            sale_price = WildberriesClient._safe_int(item.get("priceU"))
         if sale_price is None or sale_price < min_price_units:
             return False
 
