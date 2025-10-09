@@ -43,6 +43,7 @@ async def _run(args: argparse.Namespace) -> None:
         min_feedbacks=settings.min_feedbacks,
         min_discount=settings.min_discount,
         page_delay_ms=args.throttle,
+        force_html_first=args.html_first,
     )
 
     banned: List[str] = args.banned or []
@@ -56,9 +57,14 @@ async def _run(args: argparse.Namespace) -> None:
     )
 
     for summary in client.last_page_logs:
+        extra = ""
+        html_ids = summary.get("html_ids")
+        html_enriched = summary.get("html_enriched")
+        if html_ids is not None:
+            extra = f" ids={html_ids} enriched={html_enriched}"
         print(
-            "page={page} source={source} status={status} products={products} "
-            "limit={limit} dest={dest} spp={spp} cache={cache} timing={timing:.0f}ms".format(
+            "source={source} page={page} status={status} products={products} "
+            "limit={limit} dest={dest} spp={spp} cache={cache} timing={timing:.0f}ms{extra}".format(
                 page=summary.get("page"),
                 source=summary.get("source"),
                 status=summary.get("status"),
@@ -68,12 +74,13 @@ async def _run(args: argparse.Namespace) -> None:
                 spp=summary.get("spp"),
                 cache=summary.get("cache"),
                 timing=summary.get("timing_ms", 0.0),
+                extra=extra,
             )
         )
         for item in (summary.get("top_items") or [])[:3]:
             price = item.get("price")
             price_str = f"{price}₽" if price is not None else "n/a"
-            print(f"  {item.get('id')} | {price_str} | {item.get('url')}")
+            print(f"  {item.get('id')}|{price_str}|{item.get('url')}")
 
     if not products:
         print("Ничего не найдено")
@@ -125,6 +132,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="задержка между страницами в миллисекундах",
+    )
+    parser.add_argument(
+        "--html-first",
+        action="store_true",
+        help="игнорировать JSON-эндпоинт и сразу обращаться к HTML",
     )
     return parser.parse_args()
 
