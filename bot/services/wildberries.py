@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import logging
 import random
 import re
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, List
 from urllib.parse import quote_plus
 
@@ -28,6 +30,14 @@ HEADERS = {
     "Connection": "keep-alive",
     "Accept-Encoding": "gzip, deflate, br",
 }
+
+PLAYWRIGHT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+COOKIE_TTL_SECONDS = 6 * 60 * 60
+COOKIE_FILE = Path("data/wb_cookies.json")
 
 START_LIMIT = 20
 MAX_CATALOG_ATTEMPTS = 2
@@ -190,6 +200,11 @@ class WildberriesClient:
             float(page_delay_ms) / 1000 if page_delay_ms is not None else None
         )
         self._page_delay_range = PAGE_DELAY_RANGE
+        self._cookie_file = COOKIE_FILE
+        self._cookie_ttl = COOKIE_TTL_SECONDS
+        self._cookie_cache: list[dict[str, Any]] | None = None
+        self._cookie_cache_ts: float | None = None
+        self._cookie_lock = asyncio.Lock()
 
     @staticmethod
     def _detect_http2_support() -> bool:
@@ -544,6 +559,140 @@ class WildberriesClient:
         if delay and delay > 0:
             await asyncio.sleep(delay)
 
+    async def _get_html_cookies(self, *, force_refresh: bool = False) -> list[dict[str, Any]]:
+        async with self._cookie_lock:
+            now = time.time()
+            if not force_refresh:
+                if (
+                    self._cookie_cache is not None
+                    and self._cookie_cache_ts is not None
+                    and now - self._cookie_cache_ts < self._cookie_ttl
+                ):
+                    logger.info(
+                        "[WB/Playwright] Использую сохранённые cookies (in-memory %s)",
+                        len(self._cookie_cache),
+                    )
+                    return list(self._cookie_cache)
+
+                cookies, ts = await self._load_cookies_from_disk()
+                if cookies is not None and ts is not None and now - ts < self._cookie_ttl:
+                    self._cookie_cache = cookies
+                    self._cookie_cache_ts = ts
+                    logger.info(
+                        "[WB/Playwright] Использую сохранённые cookies (file %s)", len(cookies)
+                    )
+                    return list(cookies)
+
+            logger.info("[WB/Playwright] Обновление cookies из браузера")
+            cookies = await self._warm_up_browser_session()
+            self._cookie_cache = cookies
+            self._cookie_cache_ts = time.time()
+            await self._save_cookies_to_disk(cookies)
+            return list(cookies)
+
+    async def _load_cookies_from_disk(self) -> tuple[list[dict[str, Any]] | None, float | None]:
+        def _load() -> tuple[list[dict[str, Any]] | None, float | None]:
+            if not self._cookie_file.exists():
+                return None, None
+            try:
+                stat = self._cookie_file.stat()
+                with self._cookie_file.open("r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                logger.warning("[WB/Playwright] Не удалось прочитать cookies: %s", exc)
+                return None, None
+            cookies = self._filter_cookies(data)
+            names = [c.get("name") for c in cookies if c.get("name")]
+            logger.info(
+                "[WB/Playwright] Файл cookies содержит %s записей: %s",
+                len(cookies),
+                ", ".join(names),
+            )
+            return cookies, stat.st_mtime
+
+        return await asyncio.to_thread(_load)
+
+    async def _save_cookies_to_disk(self, cookies: Sequence[Mapping[str, Any]]) -> None:
+        def _save() -> None:
+            try:
+                self._cookie_file.parent.mkdir(parents=True, exist_ok=True)
+                with self._cookie_file.open("w", encoding="utf-8") as fh:
+                    json.dump(list(cookies), fh, ensure_ascii=False, indent=2)
+            except OSError as exc:
+                logger.warning("[WB/Playwright] Не удалось сохранить cookies: %s", exc)
+
+        await asyncio.to_thread(_save)
+        names = [c.get("name") for c in cookies if c.get("name")]
+        logger.info(
+            "[WB/Playwright] Получены новые cookies (%s): %s",
+            len(cookies),
+            ", ".join(names),
+        )
+
+    async def _warm_up_browser_session(self) -> list[dict[str, Any]]:
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError as exc:
+            logger.error(
+                "Playwright не установлен. Установите 'playwright' и выполните 'playwright install chromium'."
+            )
+            raise
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(
+                locale="ru-RU",
+                user_agent=PLAYWRIGHT_USER_AGENT,
+            )
+            page = await context.new_page()
+            await page.goto("https://www.wildberries.ru/", wait_until="networkidle")
+            await page.wait_for_load_state("networkidle")
+            await asyncio.sleep(1.0)
+            cookies = await context.cookies()
+            await context.close()
+            await browser.close()
+
+        filtered = self._filter_cookies(cookies)
+        return filtered
+
+    def _filter_cookies(self, cookies: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        filtered: list[dict[str, Any]] = []
+        for cookie in cookies:
+            name = cookie.get("name")
+            value = cookie.get("value")
+            domain = cookie.get("domain") or ""
+            if not name or value is None:
+                continue
+            if "wildberries.ru" not in domain:
+                continue
+            filtered.append(
+                {
+                    "name": name,
+                    "value": value,
+                    "domain": domain,
+                    "path": cookie.get("path", "/"),
+                    "expires": cookie.get("expires"),
+                    "secure": cookie.get("secure", False),
+                    "httpOnly": cookie.get("httpOnly", False),
+                }
+            )
+        return filtered
+
+    def _apply_cookies_to_client(
+        self, client: httpx.AsyncClient, cookies: Sequence[Mapping[str, Any]]
+    ) -> None:
+        jar = httpx.Cookies()
+        for cookie in cookies:
+            name = cookie.get("name")
+            value = cookie.get("value")
+            if not name or value is None:
+                continue
+            domain = cookie.get("domain") or ".wildberries.ru"
+            path = cookie.get("path") or "/"
+            jar.set(name, value, domain=domain, path=path)
+        client.cookies.clear()
+        client.cookies.update(jar)
+
     @property
     def last_page_logs(self) -> list[dict[str, Any]]:
         return [dict(entry) for entry in self._last_page_logs]
@@ -833,11 +982,11 @@ class WildberriesClient:
         start_time: float,
     ) -> PageFetchMeta:
         html_url = url_html_search(query, page)
-        html_headers = {
-            "User-Agent": headers.get("User-Agent", HEADERS["User-Agent"]),
-            "Referer": "https://www.wildberries.ru/",
-            "Accept-Language": headers.get("Accept-Language", HEADERS["Accept-Language"]),
-        }
+        html_headers = dict(headers)
+        cookies = await self._get_html_cookies()
+        if cookies:
+            self._apply_cookies_to_client(client, cookies)
+
         response, saw_429 = await self._request_with_backoff(
             client,
             "GET",
@@ -845,6 +994,17 @@ class WildberriesClient:
             headers=html_headers,
             timeout=timeout,
         )
+        if response is not None and response.status_code in {403, 498}:
+            cookies = await self._get_html_cookies(force_refresh=True)
+            if cookies:
+                self._apply_cookies_to_client(client, cookies)
+            response, saw_429 = await self._request_with_backoff(
+                client,
+                "GET",
+                html_url,
+                headers=html_headers,
+                timeout=timeout,
+            )
         encountered_429 = encountered_429 or saw_429
         status = response.status_code if response else None
         ids: list[int] = []
@@ -954,7 +1114,7 @@ class WildberriesClient:
 
             last_response = response
             status = response.status_code
-            if status in {429, 403, 502, 503, 504}:
+            if status in {429, 403, 498, 502, 503, 504}:
                 if status == 429:
                     saw_rate_limit = True
                 retry_after = response.headers.get("Retry-After")

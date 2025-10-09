@@ -22,6 +22,8 @@
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+pip install playwright
+playwright install chromium
 ```
 
 Создайте файл `.env` и укажите в нём токен бота (для тестирования можно использовать `8269524086:AAGFIEvVXKi55hQODcNxwwrzscy5zYLSsB0`) и при необходимости параметры БД:
