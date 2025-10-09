@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     )
     request_timeout: float = Field(default=10.0, env="REQUEST_TIMEOUT")
     max_results: int = Field(default=10, env="MAX_RESULTS")
+    min_rating: float | None = Field(default=None, env="MIN_RATING")
+    min_feedbacks: int | None = Field(default=None, env="MIN_FEEDBACKS")
+    min_discount: float | None = Field(default=None, env="MIN_DISCOUNT")
     yookassa_shop_id: str | None = Field(default=None, env="YOOKASSA_SHOP_ID")
     yookassa_secret_key: str | None = Field(
         default=None,

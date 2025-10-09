@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import logging
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Mapping, Sequence
+from typing import Any, List
 
 import httpx
 
@@ -27,6 +28,15 @@ DEFAULT_SEARCH_PARAMS = {
 FALLBACK_SEARCH_URL = "https://search.wb.ru/filter"
 
 
+def build_image_url(nm_id: int) -> str:
+    """Формирует прямую ссылку на изображение карточки Wildberries."""
+
+    vol = nm_id // 100000
+    part = nm_id // 1000
+    host = (nm_id // 100000) % 10
+    return f"https://basket-0{host}.wb.ru/vol{vol}/part{part}/{nm_id}/images/big/1.jpg"
+
+
 @dataclass(slots=True)
 class Product:
     id: int
@@ -47,12 +57,21 @@ class Product:
     seller_registration: str | None
     url: str
     image_url: str | None
+    score: float | None = None
 
 
 class WildberriesClient:
     """Client for fetching products from Wildberries search API."""
 
-    def __init__(self, timeout: float = 10.0, *, user_agent: str | None = None) -> None:
+    def __init__(
+        self,
+        timeout: float = 10.0,
+        *,
+        user_agent: str | None = None,
+        min_rating: float | None = None,
+        min_feedbacks: int | None = None,
+        min_discount: float | None = None,
+    ) -> None:
         self._timeout = timeout
         self._headers = {
             "User-Agent": user_agent
@@ -70,6 +89,9 @@ class WildberriesClient:
             "X-Requested-With": "XMLHttpRequest",
         }
         self._http2_enabled = self._detect_http2_support()
+        self._min_rating = min_rating
+        self._min_feedbacks = min_feedbacks
+        self._min_discount = min_discount
 
     @staticmethod
     def _detect_http2_support() -> bool:
@@ -95,11 +117,10 @@ class WildberriesClient:
         if max_results <= 0:
             return []
 
-        min_price_rub = max(min_price or 0, 0) if min_price is not None else None
-        max_price_rub = max_price if max_price not in (None, 0) else None
-
-        if max_price_rub is not None and max_price_rub < 0:
-            max_price_rub = None
+        min_price_rub = None if min_price is None else max(int(min_price), 0)
+        max_price_rub = None
+        if max_price not in (None, 0):
+            max_price_rub = max(int(max_price), 0)
 
         if (
             min_price_rub is not None
@@ -108,15 +129,18 @@ class WildberriesClient:
         ):
             min_price_rub, max_price_rub = max_price_rub, min_price_rub
 
-        normalized_banned = [
+        normalized_banned = {
             word.strip().lower()
             for word in banned_words
             if isinstance(word, str) and word.strip()
-        ]
+        }
 
-        filtered_items: list[dict[str, Any]] = []
+        filtered_candidates: list[dict[str, Any]] = []
         filtered_by_price = 0
         filtered_by_banned = 0
+        filtered_by_rating = 0
+        filtered_by_feedbacks = 0
+        filtered_by_discount = 0
         total_received = 0
 
         effective_timeout = float(timeout or self._timeout)
@@ -129,7 +153,7 @@ class WildberriesClient:
         ) as client:
             page = 1
 
-            while len(filtered_items) < max_results:
+            while len(filtered_candidates) < max_results:
                 params = {
                     "query": query,
                     "resultset": "catalog",
@@ -139,48 +163,53 @@ class WildberriesClient:
                 params.update(DEFAULT_SEARCH_PARAMS)
 
                 response = await self._get_with_retries(client, params)
-                payload = response.json()
 
-                products_data: Iterable[dict[str, Any]] = (
-                    payload.get("data", {}).get("products", []) or []
-                )
-                total_received += len(products_data)
+                try:
+                    payload = response.json()
+                except ValueError:
+                    logger.exception("Не удалось разобрать JSON Wildberries")
+                    break
 
+                products_data = payload.get("data", {}).get("products")
+                if isinstance(products_data, list):
+                    products_list = products_data
+                elif isinstance(products_data, Iterable):
+                    products_list = list(products_data)
+                else:
+                    products_list = []
+                total_received += len(products_list)
+
+                first_preview: Mapping[str, Any] | None = products_list[0] if products_list else None
                 logger.info(
                     "WB поиск: %s -> статус %s, товаров на странице: %s",
                     response.request.url,
                     response.status_code,
-                    len(products_data),
+                    len(products_list),
                 )
-
-                if products_data:
-                    first = products_data[0]
+                if first_preview:
+                    sale_price_u = first_preview.get("salePriceU")
+                    price_u = first_preview.get("priceU")
+                    price_rub_preview = self._price_units_to_rub(sale_price_u or price_u)
                     logger.info(
-                        "Первая карточка: id=%s, name=%s, salePriceU=%s",
-                        first.get("id"),
-                        first.get("name"),
-                        first.get("salePriceU"),
+                        "Пример карточки: id=%s, name=%s, salePriceU=%s, priceU=%s, price_rub=%s",
+                        first_preview.get("id"),
+                        first_preview.get("name"),
+                        sale_price_u,
+                        price_u,
+                        price_rub_preview,
                     )
 
-                if not products_data:
+                if not products_list:
                     break
 
-                for item in products_data:
+                page_candidates: list[dict[str, Any]] = []
+                for item in products_list:
                     product_id = item.get("id")
                     if product_id is None:
                         continue
 
-                    raw_price_units = (
-                        item.get("salePriceU")
-                        or item.get("priceU")
-                        or 0
-                    )
-                    try:
-                        price_units = int(raw_price_units)
-                    except (TypeError, ValueError):
-                        price_units = 0
-
-                    price_rub = price_units // 100
+                    price_units = item.get("salePriceU") or item.get("priceU") or 0
+                    price_rub = self._price_units_to_rub(price_units) or 0
 
                     if (
                         min_price_rub is not None
@@ -191,6 +220,7 @@ class WildberriesClient:
 
                     if (
                         max_price_rub is not None
+                        and max_price_rub > 0
                         and price_rub > max_price_rub
                     ):
                         filtered_by_price += 1
@@ -202,50 +232,114 @@ class WildberriesClient:
                             filtered_by_banned += 1
                             continue
 
-                    filtered_items.append(item)
+                    rating = self._safe_float(item.get("reviewRating"))
+                    if (
+                        self._min_rating is not None
+                        and rating is not None
+                        and rating < self._min_rating
+                    ):
+                        filtered_by_rating += 1
+                        continue
 
-                    if len(filtered_items) >= max_results:
+                    feedbacks = self._safe_int(item.get("feedbacks"))
+                    if (
+                        self._min_feedbacks is not None
+                        and feedbacks is not None
+                        and feedbacks < self._min_feedbacks
+                    ):
+                        filtered_by_feedbacks += 1
+                        continue
+
+                    discount_percent = self._compute_discount_percent(item)
+                    if (
+                        self._min_discount is not None
+                        and discount_percent is not None
+                        and discount_percent < self._min_discount
+                    ):
+                        filtered_by_discount += 1
+                        continue
+
+                    candidate = {
+                        "item": item,
+                        "price_rub": price_rub,
+                        "rating": rating,
+                        "feedbacks": feedbacks,
+                        "discount": discount_percent,
+                    }
+                    page_candidates.append(candidate)
+
+                    if len(filtered_candidates) + len(page_candidates) >= max_results:
                         break
+
+                filtered_candidates.extend(page_candidates)
+                logger.info(
+                    "После фильтра: %s товаров на странице (суммарно %s)",
+                    len(page_candidates),
+                    len(filtered_candidates),
+                )
+
+                if len(page_candidates) == 0 and len(products_list) == 0:
+                    break
+
+                if len(filtered_candidates) >= max_results:
+                    break
 
                 page += 1
 
-        if not filtered_items:
+        if not filtered_candidates:
+            reason_parts = []
             if total_received == 0:
-                reason = "пустой ответ от API"
-            elif filtered_by_price and not filtered_by_banned:
-                reason = "filtered by min/max"
-            elif filtered_by_banned and not filtered_by_price:
-                reason = "filtered by banned words"
-            elif filtered_by_price and filtered_by_banned:
-                reason = "filtered by min/max and banned words"
-            else:
-                reason = "неизвестная причина"
-
-            logger.info("После фильтрации товаров нет (%s)", reason)
+                reason_parts.append("empty API")
+            if filtered_by_price:
+                reason_parts.append("min/max")
+            if filtered_by_banned:
+                reason_parts.append("banned words")
+            if filtered_by_rating:
+                reason_parts.append("rating")
+            if filtered_by_feedbacks:
+                reason_parts.append("feedbacks")
+            if filtered_by_discount:
+                reason_parts.append("discount")
+            reason = ", ".join(reason_parts) or "unknown"
+            logger.info("После фильтрации товаров нет (reason: %s)", reason)
             return []
 
-        limited_items = filtered_items[:max_results]
+        self._apply_scores(filtered_candidates)
+        filtered_candidates.sort(
+            key=lambda c: (
+                c.get("score") is not None,
+                c.get("score") or 0.0,
+                c.get("discount") or 0.0,
+                c.get("rating") or 0.0,
+                -(c.get("price_rub") or 0),
+            ),
+            reverse=True,
+        )
+
+        limited_candidates = filtered_candidates[:max_results]
         detail_map = await self._fetch_details(
-            (int(item["id"]) for item in limited_items), timeout=effective_timeout
+            (int(candidate["item"]["id"]) for candidate in limited_candidates),
+            timeout=effective_timeout,
         )
 
         products: List[Product] = []
-        for item in limited_items:
+        for candidate in limited_candidates:
+            item = candidate["item"]
             product_id = int(item["id"])
             detail = detail_map.get(product_id, {})
             features = self._extract_features(detail)
             stock = self._extract_stock(detail)
             registration = self._extract_registration(detail)
 
-            products.append(
-                self._build_product(
-                    item,
-                    detail,
-                    features=features,
-                    stock=stock,
-                    registration=registration,
-                )
+            product = self._build_product(
+                item,
+                detail,
+                features=features,
+                stock=stock,
+                registration=registration,
             )
+            product.score = candidate.get("score")
+            products.append(product)
 
         return products
 
@@ -265,7 +359,7 @@ class WildberriesClient:
                 last_exception = exc
                 if attempt == attempts:
                     raise
-                delay = 0.5 * attempt
+                delay = 0.3 * attempt
                 logger.warning(
                     "Ошибка сети %s при обращении к Wildberries (попытка %s/%s). "
                     "Повтор через %.1f с",
@@ -383,6 +477,69 @@ class WildberriesClient:
             image_url=self._extract_photo(detail, product_id),
         )
 
+    @staticmethod
+    def _price_units_to_rub(value: Any) -> int | None:
+        try:
+            units = int(value)
+        except (TypeError, ValueError):
+            return None
+        return units // 100
+
+    def _compute_discount_percent(self, item: Mapping[str, Any]) -> float | None:
+        sale_units = self._safe_int(item.get("salePriceU"))
+        base_units = self._safe_int(item.get("priceU"))
+
+        if base_units and sale_units is not None and base_units > 0:
+            discount = (base_units - sale_units) / base_units * 100
+            return round(discount, 2)
+
+        sale_percent = self._safe_float(item.get("sale"))
+        if sale_percent is not None:
+            return float(sale_percent)
+
+        return None
+
+    def _apply_scores(self, candidates: list[dict[str, Any]]) -> None:
+        prices = [c.get("price_rub") for c in candidates if c.get("price_rub") is not None]
+        discounts = [c.get("discount") for c in candidates if c.get("discount") is not None]
+        ratings = [c.get("rating") for c in candidates if c.get("rating") is not None]
+        feedbacks_list = [
+            c.get("feedbacks") for c in candidates if c.get("feedbacks") is not None
+        ]
+
+        def normalize(value: float | int | None, values: list[float | int]) -> float | None:
+            if value is None or not values:
+                return None
+            min_value = float(min(values))
+            max_value = float(max(values))
+            if max_value == min_value:
+                return 0.5
+            return (float(value) - min_value) / (max_value - min_value)
+
+        for candidate in candidates:
+            price_norm = normalize(candidate.get("price_rub"), prices)
+            discount_norm = normalize(candidate.get("discount"), discounts)
+            rating_norm = normalize(candidate.get("rating"), ratings)
+            feedbacks_norm = normalize(candidate.get("feedbacks"), feedbacks_list)
+
+            weighted_values: list[tuple[float, float]] = []
+            if price_norm is not None:
+                weighted_values.append((0.35, 1 - price_norm))
+            if discount_norm is not None:
+                weighted_values.append((0.25, discount_norm))
+            if rating_norm is not None:
+                weighted_values.append((0.25, rating_norm))
+            if feedbacks_norm is not None:
+                weighted_values.append((0.15, feedbacks_norm))
+
+            if not weighted_values:
+                candidate["score"] = None
+                continue
+
+            total_weight = sum(weight for weight, _ in weighted_values)
+            score = sum(weight * value for weight, value in weighted_values) / total_weight
+            candidate["score"] = round(score, 4)
+
     async def _perform_search_request(
         self,
         client: httpx.AsyncClient,
@@ -497,12 +654,8 @@ class WildberriesClient:
                             return str(path)
                         return f"https://images.wbstatic.net/{path}"
 
-        return WildberriesClient._build_image_url(product_id)
+        return build_image_url(product_id)
 
     @staticmethod
     def _build_image_url(product_id: int) -> str:
-        shard = (product_id // 100000) % 10
-        return (
-            f"https://basket-0{shard}.wbstatic.net/"
-            f"vol{product_id // 100000}/part{product_id // 1000}/{product_id}/images/big/1.jpg"
-        )
+        return build_image_url(product_id)

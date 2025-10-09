@@ -78,6 +78,7 @@ async def process_query(message: Message, state: FSMContext) -> None:
     await state.set_state(SearchStates.waiting_for_min_price)
     await message.answer(
         "Укажите минимальную цену (в рублях). Например: 1500.\n"
+        "Если нижний порог не нужен, отправьте 0 или напишите «Пропустить».\n"
         "Если хотите отменить поиск, нажмите «⬅️ Отмена».",
         parse_mode=ParseMode.HTML,
         reply_markup=cancel_keyboard(),
@@ -100,14 +101,19 @@ async def process_min_price(
         return
 
     raw_value = message.text or ""
-    try:
-        min_price = _parse_price_to_int(raw_value)
-    except ValueError:
-        await message.answer(
-            "Не удалось понять цену. Введите целое число, например 999 или 2 000.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
+    normalized = raw_value.strip()
+    if normalized and normalized.casefold() not in {"пропустить", "skip"}:
+        try:
+            parsed = _parse_price_to_int(normalized)
+        except ValueError:
+            await message.answer(
+                "Не удалось понять цену. Введите целое число, например 999 или 2 000.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        min_price: int | None = parsed if parsed > 0 else None
+    else:
+        min_price = None
 
     await state.update_data(min_price=min_price)
     await state.set_state(SearchStates.waiting_for_max_price)
@@ -151,17 +157,24 @@ async def process_max_price(
 
     data = await state.get_data()
     query = str(data.get("query", ""))
-    min_price = int(data.get("min_price", 0))
+    stored_min = data.get("min_price")
+    min_price = int(stored_min) if stored_min not in (None, "") else None
 
     settings = get_settings()
-    client = WildberriesClient(timeout=settings.request_timeout)
+    client = WildberriesClient(
+        timeout=settings.request_timeout,
+        min_rating=settings.min_rating,
+        min_feedbacks=settings.min_feedbacks,
+        min_discount=settings.min_discount,
+    )
 
+    user_banned = banned_words.list_words(message.from_user.id)
     try:
         products = await client.search_products(
             query=query,
             min_price=min_price,
             max_price=max_price,
-            banned_words=banned_words.list_words(message.from_user.id),
+            banned_words=user_banned,
             max_results=settings.max_results,
             timeout=settings.request_timeout,
         )
