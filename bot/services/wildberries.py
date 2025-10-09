@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import logging
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Mapping, Sequence
@@ -68,6 +69,19 @@ class WildberriesClient:
             "Referer": "https://www.wildberries.ru/",
             "X-Requested-With": "XMLHttpRequest",
         }
+        self._http2_enabled = self._detect_http2_support()
+
+    @staticmethod
+    def _detect_http2_support() -> bool:
+        """Определяем, доступна ли поддержка HTTP/2 (есть ли пакет h2)."""
+
+        if importlib.util.find_spec("h2") is None:
+            logger.warning(
+                "HTTP/2 недоступен: пакет 'h2' не установлен. Запросы Wildberries будут "
+                "выполняться по HTTP/1.1"
+            )
+            return False
+        return True
 
     async def search(
         self,
@@ -90,7 +104,7 @@ class WildberriesClient:
             timeout=self._timeout,
             headers=self._headers,
             follow_redirects=True,
-            http2=True,
+            http2=self._http2_enabled,
         ) as client:
             page = 1
             while len(candidates) < max_candidates and page <= max_pages:
@@ -165,7 +179,7 @@ class WildberriesClient:
             timeout=self._timeout,
             headers=self._headers,
             follow_redirects=True,
-            http2=True,
+            http2=self._http2_enabled,
         ) as client:
             response = await client.get(DETAIL_API_URL, params=params)
             response.raise_for_status()
