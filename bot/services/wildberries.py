@@ -48,8 +48,8 @@ class WildberriesClient:
             return []
 
         normalized_excludes = [word.strip().lower() for word in (exclude_words or []) if word.strip()]
-        max_candidates = max(limit * 3, limit or 1)
-        max_pages = 5
+        max_candidates = max(limit * 5, limit or 1)
+        max_pages = 10
 
         candidates: list[dict[str, Any]] = []
         min_price_units = int(min_price * 100)
@@ -214,6 +214,8 @@ class WildberriesClient:
         excludes: list[str],
     ) -> bool:
         sale_price = item.get("salePriceU")
+        if sale_price is None:
+            sale_price = item.get("priceU")
         if sale_price is None or sale_price < min_price_units:
             return False
 

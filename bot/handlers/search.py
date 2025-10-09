@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import httpx
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -10,6 +10,12 @@ from aiogram.types import Message
 from aiogram.exceptions import TelegramBadRequest
 
 from ..config import get_settings
+from ..keyboards import (
+    CANCEL_BUTTON,
+    SEARCH_BUTTON,
+    cancel_keyboard,
+    main_menu_keyboard,
+)
 from ..services.banned_words import BannedWordsService
 from ..services.wildberries import WildberriesClient
 
@@ -22,17 +28,29 @@ class SearchStates(StatesGroup):
 
 
 @router.message(Command("search"))
+@router.message(F.text.casefold() == SEARCH_BUTTON.casefold())
 async def search_command(message: Message, state: FSMContext) -> None:
     await state.set_state(SearchStates.waiting_for_query)
     await message.answer(
-        "Введите название товара, который хотите найти на Wildberries.",
+        "Введите название товара, который хотите найти на Wildberries.\n"
+        "При необходимости нажмите «⬅️ Отмена», чтобы вернуться в меню.",
         parse_mode=ParseMode.HTML,
+        reply_markup=cancel_keyboard(),
     )
 
 
 @router.message(SearchStates.waiting_for_query)
 async def process_query(message: Message, state: FSMContext) -> None:
-    query = message.text.strip()
+    if message.text and message.text.casefold() == CANCEL_BUTTON.casefold():
+        await state.clear()
+        await message.answer(
+            "Поиск отменён. Что хотите сделать дальше?",
+            reply_markup=main_menu_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    query = (message.text or "").strip()
     if not query:
         await message.answer(
             "Название не может быть пустым. Попробуйте ещё раз.",
@@ -43,8 +61,10 @@ async def process_query(message: Message, state: FSMContext) -> None:
     await state.update_data(query=query)
     await state.set_state(SearchStates.waiting_for_price)
     await message.answer(
-        "Укажите минимальную цену (в рублях). Например: 1500",
+        "Укажите минимальную цену (в рублях). Например: 1500.\n"
+        "Если хотите отменить поиск, нажмите «⬅️ Отмена».",
         parse_mode=ParseMode.HTML,
+        reply_markup=cancel_keyboard(),
     )
 
 
@@ -54,7 +74,16 @@ async def process_price(
     state: FSMContext,
     banned_words: BannedWordsService,
 ) -> None:
-    text = message.text.replace(",", ".")
+    if message.text and message.text.casefold() == CANCEL_BUTTON.casefold():
+        await state.clear()
+        await message.answer(
+            "Поиск отменён. Вы можете выбрать новое действие из меню.",
+            reply_markup=main_menu_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    text = (message.text or "").replace(",", ".")
     try:
         min_price = float(text)
         if min_price < 0:
@@ -83,6 +112,7 @@ async def process_price(
         await message.answer(
             "Не удалось получить данные от Wildberries. Попробуйте позже или измените запрос.",
             parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard(),
         )
         await state.clear()
         return
@@ -153,3 +183,8 @@ async def process_price(
             await message.answer(caption, parse_mode=ParseMode.HTML)
 
     await state.clear()
+    await message.answer(
+        "Готово! Выберите следующее действие.",
+        reply_markup=main_menu_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
