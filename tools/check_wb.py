@@ -85,8 +85,8 @@ def parse_args() -> argparse.Namespace:
         description="Проверка поискового клиента Wildberries",
     )
     parser.add_argument("--query", required=True, help="поисковый запрос")
-    parser.add_argument("--min", type=int, default=None)
-    parser.add_argument("--max", type=int, default=None)
+    parser.add_argument("--min", default=None, help="минимальная цена в рублях")
+    parser.add_argument("--max", default=None, help="максимальная цена в рублях")
     parser.add_argument(
         "--limit",
         type=int,

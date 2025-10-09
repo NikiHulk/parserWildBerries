@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import logging
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, List
@@ -25,23 +26,64 @@ HEADERS = {
     "Connection": "keep-alive",
 }
 
+WB_REGIONS = "80,64,38,4,115,83,33,68,70,86,75,30,40,48,69,22,66,31,1,114"
+DESTS = [-1257786, -1069100, -1044448]
+SPPS = [30, 0]
 
-def wb_catalog_url(query: str, page: int = 1, limit: int = 100) -> str:
-    """Возвращает корректный JSON-эндпоинт каталога без .aspx."""
+NM_RE = re.compile(r'data-nm-id="(\d+)"')
 
+
+def url_catalog(query: str, page: int, limit: int, dest: int, spp: int) -> str:
     return (
         "https://catalog.wb.ru/catalog/0/search"
-        f"?appType=1&curr=rub&dest=-1257786&spp=30"
-        f"&page={page}&limit={limit}&query={quote_plus(query)}"
+        f"?appType=1&curr=rub&dest={dest}&spp={spp}"
+        f"&regions={WB_REGIONS}&page={page}&limit={limit}&query={quote_plus(query)}"
     )
 
 
-def wb_exactmatch_url(query: str, page: int = 1, limit: int = 100) -> str:
+def url_exactmatch(query: str, page: int, limit: int, dest: int, spp: int) -> str:
     return (
         "https://search.wb.ru/exactmatch/ru/common/v4/search"
-        f"?appType=1&curr=rub&dest=-1257786&spp=30&resultset=catalog"
-        f"&page={page}&limit={limit}&query={quote_plus(query)}"
+        f"?appType=1&curr=rub&dest={dest}&spp={spp}&resultset=catalog"
+        f"&regions={WB_REGIONS}&page={page}&limit={limit}&query={quote_plus(query)}"
     )
+
+
+def url_catalog_alt(query: str, page: int, limit: int, dest: int, spp: int) -> str:
+    return (
+        "https://wbxcatalog-ru.wildberries.ru/catalog/0/search"
+        f"?appType=1&curr=rub&dest={dest}&spp={spp}"
+        f"&regions={WB_REGIONS}&page={page}&limit={limit}&query={quote_plus(query)}"
+    )
+
+
+def url_html_search(query: str, page: int) -> str:
+    return (
+        "https://www.wildberries.ru/catalog/0/search.aspx"
+        f"?search={quote_plus(query)}&page={page}"
+    )
+
+
+def parse_products_json(
+    response: httpx.Response, url: str, source: str
+) -> list[dict[str, Any]]:
+    try:
+        payload = response.json()
+    except Exception:
+        logger.error(
+            "non-JSON from WB (%s) %s status=%s body[:200]=%r",
+            source,
+            url,
+            response.status_code,
+            (response.text or "")[:200],
+        )
+        return []
+
+    data = payload.get("data") or {}
+    products = data.get("products") or []
+    if isinstance(products, Sequence):
+        return [item for item in products if isinstance(item, dict)]
+    return []
 
 
 def build_image_url(nm_id: int) -> str:
@@ -174,7 +216,13 @@ class WildberriesClient:
             page = 1
 
             while len(filtered_candidates) < max_results:
-                _, _, products_list = await self._fetch_page(
+                (
+                    page_products,
+                    source,
+                    _url,
+                    used_dest,
+                    used_spp,
+                ) = await self._fetch_page(
                     client,
                     query=query,
                     page=page,
@@ -182,11 +230,27 @@ class WildberriesClient:
                     timeout=effective_timeout,
                 )
 
-                products_list = list(products_list or [])
+                raw_products = page_products or []
+                products_list: list[dict[str, Any]] = [
+                    item if isinstance(item, dict) else dict(item)
+                    for item in raw_products
+                ]
                 total_received += len(products_list)
 
                 if not products_list:
                     break
+
+                await self._enrich_products_from_details(
+                    products_list,
+                    timeout=effective_timeout,
+                )
+
+                before_count = len(products_list)
+                page_price_filtered = 0
+                page_banned_filtered = 0
+                page_rating_filtered = 0
+                page_feedback_filtered = 0
+                page_discount_filtered = 0
 
                 page_candidates: list[dict[str, Any]] = []
                 for item in products_list:
@@ -194,21 +258,23 @@ class WildberriesClient:
                     if product_id is None:
                         continue
 
-                    price_units = item.get("salePriceU") or item.get("priceU") or 0
-                    price_rub = self._price_units_to_rub(price_units) or 0
+                    price_units = item.get("salePriceU") or item.get("priceU")
+                    price_rub = self._price_units_to_rub(price_units)
 
                     if (
                         min_price_rub is not None
-                        and price_rub < min_price_rub
+                        and (price_rub is None or price_rub < min_price_rub)
                     ):
                         filtered_by_price += 1
+                        page_price_filtered += 1
                         continue
 
                     if (
                         max_price_rub is not None
-                        and price_rub > max_price_rub
+                        and (price_rub is None or price_rub > max_price_rub)
                     ):
                         filtered_by_price += 1
+                        page_price_filtered += 1
                         continue
 
                     if normalized_banned:
@@ -217,6 +283,7 @@ class WildberriesClient:
                         ).lower()
                         if any(word in haystack for word in normalized_banned):
                             filtered_by_banned += 1
+                            page_banned_filtered += 1
                             continue
 
                     rating = self._safe_float(item.get("reviewRating"))
@@ -226,6 +293,7 @@ class WildberriesClient:
                         and rating < self._min_rating
                     ):
                         filtered_by_rating += 1
+                        page_rating_filtered += 1
                         continue
 
                     feedbacks = self._safe_int(item.get("feedbacks"))
@@ -235,6 +303,7 @@ class WildberriesClient:
                         and feedbacks < self._min_feedbacks
                     ):
                         filtered_by_feedbacks += 1
+                        page_feedback_filtered += 1
                         continue
 
                     discount_percent = self._compute_discount_percent(item)
@@ -244,6 +313,7 @@ class WildberriesClient:
                         and discount_percent < self._min_discount
                     ):
                         filtered_by_discount += 1
+                        page_discount_filtered += 1
                         continue
 
                     candidate = {
@@ -259,9 +329,22 @@ class WildberriesClient:
                         break
 
                 filtered_candidates.extend(page_candidates)
+
+                after_price_count = before_count - page_price_filtered
+                after_banned_count = after_price_count - page_banned_filtered
+                after_quality_count = len(page_candidates)
+
                 logger.info(
-                    "После фильтра: %s товаров на странице (суммарно %s)",
-                    len(page_candidates),
+                    "Страница %s (%s, dest=%s, spp=%s): before=%s after_price=%s "
+                    "after_banned=%s after_quality=%s total=%s",
+                    page,
+                    source,
+                    used_dest,
+                    used_spp,
+                    before_count,
+                    after_price_count,
+                    after_banned_count,
+                    after_quality_count,
                     len(filtered_candidates),
                 )
 
@@ -341,148 +424,142 @@ class WildberriesClient:
         page: int,
         limit: int,
         timeout: float,
-    ) -> tuple[str, int | None, Sequence[Mapping[str, Any]]]:
-        catalog_url = wb_catalog_url(query, page=page, limit=limit)
-        response = await self._request_with_retry(
-            client,
-            catalog_url,
-            timeout=timeout,
-        )
-        products = self._parse_products(response, catalog_url, "catalog")
-        preview = products[0] if products else None
-        self._log_page("catalog", catalog_url, response, products, preview)
+    ) -> tuple[list[dict[str, Any]], str, str, int | None, int | None]:
+        for dest in DESTS:
+            for spp in SPPS:
+                for builder, label in (
+                    (url_catalog, "catalog"),
+                    (url_catalog_alt, "catalog_alt"),
+                    (url_exactmatch, "exactmatch"),
+                ):
+                    url = builder(query, page, limit, dest, spp)
+                    for attempt in range(1, 4):
+                        try:
+                            response = await client.get(url, timeout=timeout)
+                        except (httpx.ReadTimeout, httpx.ConnectError) as exc:
+                            logger.warning(
+                                "WB %s attempt %s failed: %s",
+                                label,
+                                attempt,
+                                exc,
+                            )
+                            await asyncio.sleep(0.3)
+                            continue
 
-        if response.status_code == 200 and products:
-            return "catalog", response.status_code, products
+                        products = parse_products_json(response, url, label)
+                        logger.info(
+                            "WB запрос (%s): %s -> %s, products=%s (dest=%s,spp=%s)",
+                            label,
+                            url,
+                            response.status_code,
+                            len(products),
+                            dest,
+                            spp,
+                        )
+                        if products:
+                            preview = products[0]
+                            sale_price_u = preview.get("salePriceU")
+                            price_u = preview.get("priceU")
+                            price_rub_preview = self._price_units_to_rub(
+                                sale_price_u or price_u
+                            )
+                            logger.info(
+                                "Пример карточки: id=%s, name=%s, salePriceU=%s, priceU=%s, price_rub=%s",
+                                preview.get("id"),
+                                preview.get("name"),
+                                sale_price_u,
+                                price_u,
+                                price_rub_preview,
+                            )
+                            return products, label, url, dest, spp
 
-        exact_url = wb_exactmatch_url(query, page=page, limit=limit)
-        fallback_response = await self._request_with_retry(
-            client,
-            exact_url,
-            timeout=timeout,
-        )
-        fallback_products = self._parse_products(
-            fallback_response,
-            exact_url,
-            "exactmatch",
-        )
-        fallback_preview = fallback_products[0] if fallback_products else None
-        self._log_page(
-            "exactmatch",
-            exact_url,
-            fallback_response,
-            fallback_products,
-            fallback_preview,
-        )
+                        if response.status_code == 200:
+                            break
 
-        if fallback_response.status_code == 200 and fallback_products:
-            return "exactmatch", fallback_response.status_code, fallback_products
-
-        status = (
-            fallback_response.status_code
-            if fallback_response is not None
-            else response.status_code
-        )
-        logger.info(
-            "WB поиск (empty): %s -> статус %s, товаров: %s",
-            exact_url,
-            status,
-            len(fallback_products or []),
-        )
-        return "empty", status, fallback_products
-
-    async def _request_with_retry(
-        self,
-        client: httpx.AsyncClient,
-        url: str,
-        *,
-        timeout: float,
-        attempts: int = 3,
-    ) -> httpx.Response:
-        last_exception: Exception | None = None
-
-        for attempt in range(1, attempts + 1):
-            try:
-                return await client.get(url, timeout=timeout)
-            except (httpx.ReadTimeout, httpx.ConnectError) as exc:
-                last_exception = exc
-                if attempt == attempts:
-                    raise
-                delay = 0.3 * attempt
-                logger.warning(
-                    "Ошибка сети %s при обращении к %s (попытка %s/%s). Повтор через %.1f с",
-                    exc.__class__.__name__,
-                    url,
-                    attempt,
-                    attempts,
-                    delay,
-                )
-                await asyncio.sleep(delay)
-
-        if last_exception is not None:
-            raise last_exception
-
-        raise RuntimeError("Не удалось выполнить запрос к Wildberries")
-
-    def _parse_products(
-        self,
-        response: httpx.Response,
-        url: str,
-        source: str,
-    ) -> list[Mapping[str, Any]]:
-        """Пытаемся разобрать JSON-ответ Wildberries с защитой от HTML-ошибок."""
-
+        html_url = url_html_search(query, page)
+        html_headers = {
+            "User-Agent": self._headers.get("User-Agent", HEADERS["User-Agent"]),
+            "Referer": "https://www.wildberries.ru/",
+        }
         try:
-            payload = response.json()
-        except Exception:
-            logger.error(
-                "WB вернул не-JSON (%s %s). Статус: %s. Тело (первые 200 символов): %r",
-                source,
-                url,
-                response.status_code,
-                (response.text or "")[:200],
-            )
-            return []
+            response = await client.get(html_url, headers=html_headers, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("WB HTML fallback error: %s", exc)
+            return [], "empty", html_url, None, None
 
-        data = payload.get("data")
-        if not isinstance(data, Mapping):
-            return []
-
-        products_data = data.get("products")
-        if isinstance(products_data, list):
-            return [item for item in products_data if isinstance(item, Mapping)]
-        if isinstance(products_data, Iterable):
-            return [item for item in products_data if isinstance(item, Mapping)]
-        return []
-
-    def _log_page(
-        self,
-        source: str,
-        url: str,
-        response: httpx.Response,
-        products: Sequence[Mapping[str, Any]],
-        preview: Mapping[str, Any] | None,
-    ) -> None:
-        status = response.status_code if response is not None else None
+        ids = [int(match) for match in NM_RE.findall(response.text)]
         logger.info(
-            "WB поиск (%s): %s -> статус %s, товаров: %s",
-            source,
-            url,
-            status,
-            len(products),
+            "WB HTML fallback: %s -> статус=%s nmIds=%s",
+            html_url,
+            response.status_code,
+            len(ids),
         )
-        if preview:
-            sale_price_u = preview.get("salePriceU")
-            price_u = preview.get("priceU")
-            price_rub_preview = self._price_units_to_rub(sale_price_u or price_u)
-            logger.info(
-                "Пример карточки: id=%s, name=%s, salePriceU=%s, priceU=%s, price_rub=%s",
-                preview.get("id"),
-                preview.get("name"),
-                sale_price_u,
-                price_u,
-                price_rub_preview,
-            )
+        if not ids:
+            return [], "empty", html_url, None, None
+
+        fake_products = [{"id": nm_id} for nm_id in ids]
+        return fake_products, "html", html_url, None, None
+
+    async def _enrich_products_from_details(
+        self, items: list[dict[str, Any]], *, timeout: float
+    ) -> None:
+        missing_ids: list[int] = []
+        for item in items:
+            product_id = item.get("id")
+            if product_id is None:
+                continue
+
+            try:
+                product_id_int = int(product_id)
+            except (TypeError, ValueError):
+                continue
+
+            needs_detail = False
+            if not item.get("salePriceU") and not item.get("priceU"):
+                needs_detail = True
+            if not item.get("name") or not item.get("brand"):
+                needs_detail = True
+            if needs_detail:
+                missing_ids.append(product_id_int)
+
+        if not missing_ids:
+            return
+
+        detail_map = await self._fetch_details(missing_ids, timeout=timeout)
+        for item in items:
+            product_id = item.get("id")
+            if product_id is None:
+                continue
+            try:
+                product_id_int = int(product_id)
+            except (TypeError, ValueError):
+                continue
+
+            detail = detail_map.get(product_id_int)
+            if not detail:
+                continue
+
+            for key in ("name", "brand", "salePriceU", "priceU", "sale"):
+                if not item.get(key) and detail.get(key) not in (None, ""):
+                    item[key] = detail.get(key)
+
+            if not item.get("reviewRating") and detail.get("reviewRating") is not None:
+                item["reviewRating"] = detail.get("reviewRating")
+            if not item.get("feedbacks") and detail.get("feedbacks") is not None:
+                item["feedbacks"] = detail.get("feedbacks")
+            if not item.get("supplierName") and detail.get("supplierName"):
+                item["supplierName"] = detail.get("supplierName")
+            if not item.get("supplierRating") and detail.get("supplierRating") is not None:
+                item["supplierRating"] = detail.get("supplierRating")
+            if not item.get("supplierOrders") and detail.get("supplierOrders") is not None:
+                item["supplierOrders"] = detail.get("supplierOrders")
+
+            extended = detail.get("extended")
+            if isinstance(extended, Mapping):
+                if not item.get("salePriceU") and extended.get("clientPriceU"):
+                    item["salePriceU"] = extended.get("clientPriceU")
+                if not item.get("priceU") and extended.get("promoPriceU"):
+                    item["priceU"] = extended.get("promoPriceU")
 
     async def _fetch_details(
         self, product_ids: Iterable[int], *, timeout: float
