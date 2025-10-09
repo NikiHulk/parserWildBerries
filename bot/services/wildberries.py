@@ -6,26 +6,40 @@ import logging
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, List
+from urllib.parse import quote_plus
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-API_URL = "https://search.wb.ru/exactmatch/ru/common/v4/search"
 DETAIL_API_URL = "https://card.wb.ru/cards/detail"
-DEFAULT_SEARCH_PARAMS = {
-    "appType": 1,
-    "curr": "rub",
-    "dest": -1257786,
-    # Wildberries отдаёт результаты только для выбранного списка регионов.
-    "regions": (
-        "80,64,38,4,115,83,33,68,70,86,75,30,40,48,69,22,66,31,1,114"
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     ),
-    # Значение 30 соответствует анонимному поиску на сайте и не требует авторизации.
-    "spp": 30,
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "ru,en;q=0.9",
+    "Referer": "https://www.wildberries.ru/",
+    "Connection": "keep-alive",
 }
 
-FALLBACK_SEARCH_URL = "https://search.wb.ru/filter"
+
+def wb_catalog_url(query: str, page: int = 1, limit: int = 100) -> str:
+    return (
+        "https://catalog.wb.ru/catalog/0/search.aspx"
+        f"?appType=1&curr=rub&dest=-1257786&spp=30"
+        f"&page={page}&limit={limit}&query={quote_plus(query)}"
+    )
+
+
+def wb_exactmatch_url(query: str, page: int = 1, limit: int = 100) -> str:
+    return (
+        "https://search.wb.ru/exactmatch/ru/common/v4/search"
+        f"?appType=1&curr=rub&dest=-1257786&spp=30&resultset=catalog"
+        f"&page={page}&limit={limit}&query={quote_plus(query)}"
+    )
 
 
 def build_image_url(nm_id: int) -> str:
@@ -45,6 +59,7 @@ class Product:
     price: float | None
     wallet_price: float | None
     best_buyout_price: float | None
+    discount: float | None
     profit_rub: float | None
     profit_percent: float | None
     rating: float | None
@@ -73,21 +88,9 @@ class WildberriesClient:
         min_discount: float | None = None,
     ) -> None:
         self._timeout = timeout
-        self._headers = {
-            "User-Agent": user_agent
-            or (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0 Safari/537.36"
-            ),
-            # Wildberries блокирует запросы без набора браузерных заголовков.
-            # Дублируем основные поля из реального фронтенда, чтобы избежать 403.
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Origin": "https://www.wildberries.ru",
-            "Referer": "https://www.wildberries.ru/",
-            "X-Requested-With": "XMLHttpRequest",
-        }
+        self._headers = dict(HEADERS)
+        if user_agent:
+            self._headers["User-Agent"] = user_agent
         self._http2_enabled = self._detect_http2_support()
         self._min_rating = min_rating
         self._min_feedbacks = min_feedbacks
@@ -117,10 +120,25 @@ class WildberriesClient:
         if max_results <= 0:
             return []
 
-        min_price_rub = None if min_price is None else max(int(min_price), 0)
-        max_price_rub = None
+        min_price_rub: int | None = None
+        if min_price is not None:
+            try:
+                min_candidate = int(min_price)
+            except (TypeError, ValueError):
+                min_candidate = None
+            else:
+                min_candidate = max(min_candidate, 0)
+                min_price_rub = min_candidate or None
+
+        max_price_rub: int | None = None
         if max_price not in (None, 0):
-            max_price_rub = max(int(max_price), 0)
+            try:
+                max_candidate = int(max_price)
+            except (TypeError, ValueError):
+                max_candidate = None
+            else:
+                max_candidate = max(max_candidate, 0)
+                max_price_rub = max_candidate or None
 
         if (
             min_price_rub is not None
@@ -154,50 +172,16 @@ class WildberriesClient:
             page = 1
 
             while len(filtered_candidates) < max_results:
-                params = {
-                    "query": query,
-                    "resultset": "catalog",
-                    "limit": 100,
-                    "page": page,
-                }
-                params.update(DEFAULT_SEARCH_PARAMS)
-
-                response = await self._get_with_retries(client, params)
-
-                try:
-                    payload = response.json()
-                except ValueError:
-                    logger.exception("Не удалось разобрать JSON Wildberries")
-                    break
-
-                products_data = payload.get("data", {}).get("products")
-                if isinstance(products_data, list):
-                    products_list = products_data
-                elif isinstance(products_data, Iterable):
-                    products_list = list(products_data)
-                else:
-                    products_list = []
-                total_received += len(products_list)
-
-                first_preview: Mapping[str, Any] | None = products_list[0] if products_list else None
-                logger.info(
-                    "WB поиск: %s -> статус %s, товаров на странице: %s",
-                    response.request.url,
-                    response.status_code,
-                    len(products_list),
+                _, _, products_list = await self._fetch_page(
+                    client,
+                    query=query,
+                    page=page,
+                    limit=100,
+                    timeout=effective_timeout,
                 )
-                if first_preview:
-                    sale_price_u = first_preview.get("salePriceU")
-                    price_u = first_preview.get("priceU")
-                    price_rub_preview = self._price_units_to_rub(sale_price_u or price_u)
-                    logger.info(
-                        "Пример карточки: id=%s, name=%s, salePriceU=%s, priceU=%s, price_rub=%s",
-                        first_preview.get("id"),
-                        first_preview.get("name"),
-                        sale_price_u,
-                        price_u,
-                        price_rub_preview,
-                    )
+
+                products_list = list(products_list or [])
+                total_received += len(products_list)
 
                 if not products_list:
                     break
@@ -220,14 +204,15 @@ class WildberriesClient:
 
                     if (
                         max_price_rub is not None
-                        and max_price_rub > 0
                         and price_rub > max_price_rub
                     ):
                         filtered_by_price += 1
                         continue
 
                     if normalized_banned:
-                        haystack = f"{item.get('name', '')} {item.get('brand', '')}".lower()
+                        haystack = (
+                            f"{item.get('name', '')} {item.get('brand', '')}"
+                        ).lower()
                         if any(word in haystack for word in normalized_banned):
                             filtered_by_banned += 1
                             continue
@@ -277,9 +262,6 @@ class WildberriesClient:
                     len(page_candidates),
                     len(filtered_candidates),
                 )
-
-                if len(page_candidates) == 0 and len(products_list) == 0:
-                    break
 
                 if len(filtered_candidates) >= max_results:
                     break
@@ -337,33 +319,79 @@ class WildberriesClient:
                 features=features,
                 stock=stock,
                 registration=registration,
+                discount=candidate.get("discount"),
             )
             product.score = candidate.get("score")
             products.append(product)
 
         return products
 
-    async def _get_with_retries(
+    async def _fetch_page(
         self,
         client: httpx.AsyncClient,
-        params: Mapping[str, Any],
         *,
+        query: str,
+        page: int,
+        limit: int,
+        timeout: float,
+    ) -> tuple[str, int | None, Sequence[Mapping[str, Any]]]:
+        catalog_url = wb_catalog_url(query, page=page, limit=limit)
+        response = await self._request_with_retry(
+            client,
+            catalog_url,
+            timeout=timeout,
+        )
+        products, preview = self._parse_products(response)
+        self._log_page("catalog", catalog_url, response, products, preview)
+
+        if response.status_code == 200 and products:
+            return "catalog", response.status_code, products
+
+        exact_url = wb_exactmatch_url(query, page=page, limit=limit)
+        fallback_response = await self._request_with_retry(
+            client,
+            exact_url,
+            timeout=timeout,
+        )
+        fallback_products, fallback_preview = self._parse_products(fallback_response)
+        self._log_page(
+            "exactmatch", exact_url, fallback_response, fallback_products, fallback_preview
+        )
+
+        if fallback_response.status_code == 200 and fallback_products:
+            return "exactmatch", fallback_response.status_code, fallback_products
+
+        status = fallback_response.status_code if fallback_response is not None else response.status_code
+        logger.info(
+            "WB поиск (empty): %s -> статус %s, товаров на странице: %s",
+            exact_url,
+            status,
+            len(fallback_products or []),
+        )
+        return "empty", status, fallback_products
+
+    async def _request_with_retry(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        timeout: float,
         attempts: int = 3,
     ) -> httpx.Response:
         last_exception: Exception | None = None
 
         for attempt in range(1, attempts + 1):
             try:
-                return await self._perform_search_request(client, params)
+                return await client.get(url, timeout=timeout)
             except (httpx.ReadTimeout, httpx.ConnectError) as exc:
                 last_exception = exc
                 if attempt == attempts:
                     raise
                 delay = 0.3 * attempt
                 logger.warning(
-                    "Ошибка сети %s при обращении к Wildberries (попытка %s/%s). "
-                    "Повтор через %.1f с",
+                    "Ошибка сети %s при обращении к %s (попытка %s/%s). Повтор через %.1f с",
                     exc.__class__.__name__,
+                    url,
                     attempt,
                     attempts,
                     delay,
@@ -374,6 +402,62 @@ class WildberriesClient:
             raise last_exception
 
         raise RuntimeError("Не удалось выполнить запрос к Wildberries")
+
+    def _parse_products(
+        self, response: httpx.Response
+    ) -> tuple[list[Mapping[str, Any]], Mapping[str, Any] | None]:
+        try:
+            payload = response.json()
+        except ValueError:
+            logger.exception(
+                "Не удалось разобрать JSON Wildberries (url=%s)",
+                getattr(response.request, "url", "unknown"),
+            )
+            return [], None
+
+        products_data = payload.get("data", {}).get("products")
+        if isinstance(products_data, list):
+            products_list = [
+                item for item in products_data if isinstance(item, Mapping)
+            ]
+        elif isinstance(products_data, Iterable):
+            products_list = [
+                item for item in products_data if isinstance(item, Mapping)
+            ]
+        else:
+            products_list = []
+
+        preview = products_list[0] if products_list else None
+        return products_list, preview
+
+    def _log_page(
+        self,
+        source: str,
+        url: str,
+        response: httpx.Response,
+        products: Sequence[Mapping[str, Any]],
+        preview: Mapping[str, Any] | None,
+    ) -> None:
+        status = response.status_code if response is not None else None
+        logger.info(
+            "WB поиск (%s): %s -> статус %s, товаров на странице: %s",
+            source,
+            url,
+            status,
+            len(products),
+        )
+        if preview:
+            sale_price_u = preview.get("salePriceU")
+            price_u = preview.get("priceU")
+            price_rub_preview = self._price_units_to_rub(sale_price_u or price_u)
+            logger.info(
+                "Пример карточки: id=%s, name=%s, salePriceU=%s, priceU=%s, price_rub=%s",
+                preview.get("id"),
+                preview.get("name"),
+                sale_price_u,
+                price_u,
+                price_rub_preview,
+            )
 
     async def _fetch_details(
         self, product_ids: Iterable[int], *, timeout: float
@@ -410,6 +494,7 @@ class WildberriesClient:
         features: Sequence[str] | None = None,
         stock: int | None = None,
         registration: str | None = None,
+        discount: float | None = None,
     ) -> Product:
         product_id = int(base.get("id", detail.get("id", 0)))
         sale_price = self._price_to_rub(base.get("salePriceU"))
@@ -463,6 +548,7 @@ class WildberriesClient:
             price=sale_price,
             wallet_price=wallet_price,
             best_buyout_price=best_buyout_price,
+            discount=discount,
             profit_rub=profit_rub,
             profit_percent=profit_percent,
             rating=rating,
@@ -539,39 +625,6 @@ class WildberriesClient:
             total_weight = sum(weight for weight, _ in weighted_values)
             score = sum(weight * value for weight, value in weighted_values) / total_weight
             candidate["score"] = round(score, 4)
-
-    async def _perform_search_request(
-        self,
-        client: httpx.AsyncClient,
-        params: Mapping[str, Any],
-    ) -> httpx.Response:
-        """Выполняет запрос к поиску с запасным вариантом при блокировках."""
-
-        try:
-            response = await client.get(API_URL, params=params)
-            response.raise_for_status()
-            return response
-        except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code
-            logger.warning(
-                "Поисковый API вернул статус %s, пробуем запасной эндпоинт", status
-            )
-            # Wildberries может отдавать 403/429 на основной эндпоинт.
-            # В этом случае повторяем запрос к filter API с теми же параметрами.
-            fallback_params = dict(params)
-            fallback_params.setdefault("query", params.get("query", ""))
-            fallback_params.setdefault("limit", params.get("limit", 100))
-            fallback_params.setdefault("page", params.get("page", 1))
-            try:
-                response = await client.get(FALLBACK_SEARCH_URL, params=fallback_params)
-                response.raise_for_status()
-                return response
-            except httpx.HTTPError:
-                logger.exception("Не удалось получить результаты даже с fallback")
-                raise exc
-        except httpx.HTTPError:
-            logger.exception("Ошибка при обращении к поисковому API Wildberries")
-            raise
 
     @staticmethod
     def _price_to_rub(value: Any) -> float | None:
