@@ -11,6 +11,8 @@ logger = logging.getLogger(__name__)
 
 API_URL = "https://search.wb.ru/exactmatch/ru/common/v4/search"
 DETAIL_API_URL = "https://card.wb.ru/cards/detail"
+# Верхний предел для серверного фильтра по цене (10 млн ₽ в копейках).
+MAX_PRICE_LIMIT_UNITS = 1_000_000_000
 
 DEFAULT_SEARCH_PARAMS = {
     "appType": 1,
@@ -97,7 +99,6 @@ class WildberriesClient:
         max_candidates = max(limit * 5, limit or 1)
         max_pages = 10
 
-        candidates: list[dict[str, Any]] = []
         min_price_units = int(min_price * 100)
 
         async with httpx.AsyncClient(
@@ -106,40 +107,29 @@ class WildberriesClient:
             follow_redirects=True,
             http2=self._http2_enabled,
         ) as client:
-            page = 1
-            while len(candidates) < max_candidates and page <= max_pages:
-                params = {
-                    "query": query,
-                    "limit": 100,
-                    "resultset": "catalog",
-                    "sort": "rate",
-                    "page": page,
-                }
-                # Wildberries поддерживает серверную фильтрацию по цене через параметр
-                # priceU. Это позволяет сразу отсечь дешёвые позиции и не терять
-                # релевантные товары, которые могли бы оказаться на дальних страницах
-                # из-за сортировки по рейтингу. Формат значения — "<min>;<max>",
-                # поэтому для поиска только с нижним порогом передаём минимальную цену
-                # и оставляем верхнюю границу пустой.
-                if min_price_units > 0:
-                    params["priceU"] = f"{min_price_units};"
-                params.update(DEFAULT_SEARCH_PARAMS)
+            candidates = await self._collect_candidates(
+                client,
+                query=query,
+                min_price_units=min_price_units,
+                max_candidates=max_candidates,
+                max_pages=max_pages,
+                excludes=normalized_excludes,
+                use_price_filter=min_price_units > 0,
+            )
 
-                response = await self._perform_search_request(client, params)
-                payload = response.json()
-
-                products_data: Iterable[dict[str, Any]] = payload.get("data", {}).get("products", [])
-                if not products_data:
-                    break
-
-                for item in products_data:
-                    if not self._passes_basic_filters(item, min_price_units, normalized_excludes):
-                        continue
-                    candidates.append(item)
-                    if len(candidates) >= max_candidates:
-                        break
-
-                page += 1
+            if not candidates and min_price_units > 0:
+                logger.info(
+                    "Серверный фильтр priceU не вернул товаров, повторяем поиск без него"
+                )
+                candidates = await self._collect_candidates(
+                    client,
+                    query=query,
+                    min_price_units=min_price_units,
+                    max_candidates=max_candidates,
+                    max_pages=max_pages,
+                    excludes=normalized_excludes,
+                    use_price_filter=False,
+                )
 
         products: List[Product] = []
         detail_map = await self._fetch_details(int(item["id"]) for item in candidates)
@@ -170,6 +160,55 @@ class WildberriesClient:
                 break
 
         return products
+
+    async def _collect_candidates(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        query: str,
+        min_price_units: int,
+        max_candidates: int,
+        max_pages: int,
+        excludes: list[str],
+        use_price_filter: bool,
+    ) -> list[dict[str, Any]]:
+        """Получаем список карточек с учётом пагинации и фильтров."""
+
+        candidates: list[dict[str, Any]] = []
+        page = 1
+
+        while len(candidates) < max_candidates and page <= max_pages:
+            params = {
+                "query": query,
+                "limit": 100,
+                "resultset": "catalog",
+                "sort": "rate",
+                "page": page,
+            }
+            if use_price_filter and min_price_units > 0:
+                # priceU требует верхней границы. Передаём очень большой предел,
+                # чтобы искать только по нижнему порогу и не терять дорогие товары.
+                params["priceU"] = f"{min_price_units};{MAX_PRICE_LIMIT_UNITS}"
+
+            params.update(DEFAULT_SEARCH_PARAMS)
+
+            response = await self._perform_search_request(client, params)
+            payload = response.json()
+
+            products_data: Iterable[dict[str, Any]] = payload.get("data", {}).get("products", [])
+            if not products_data:
+                break
+
+            for item in products_data:
+                if not self._passes_basic_filters(item, min_price_units, excludes):
+                    continue
+                candidates.append(item)
+                if len(candidates) >= max_candidates:
+                    break
+
+            page += 1
+
+        return candidates
 
     async def _fetch_details(self, product_ids: Iterable[int]) -> Mapping[int, dict[str, Any]]:
         ids = [str(pid) for pid in product_ids]
