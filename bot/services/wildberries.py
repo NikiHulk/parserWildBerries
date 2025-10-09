@@ -115,6 +115,14 @@ class WildberriesClient:
                     "sort": "rate",
                     "page": page,
                 }
+                # Wildberries поддерживает серверную фильтрацию по цене через параметр
+                # priceU. Это позволяет сразу отсечь дешёвые позиции и не терять
+                # релевантные товары, которые могли бы оказаться на дальних страницах
+                # из-за сортировки по рейтингу. Формат значения — "<min>;<max>",
+                # поэтому для поиска только с нижним порогом передаём минимальную цену
+                # и оставляем верхнюю границу пустой.
+                if min_price_units > 0:
+                    params["priceU"] = f"{min_price_units};"
                 params.update(DEFAULT_SEARCH_PARAMS)
 
                 response = await self._perform_search_request(client, params)
