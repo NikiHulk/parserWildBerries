@@ -10,10 +10,13 @@ import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List
-from urllib.parse import quote_plus
+from typing import TYPE_CHECKING, Any, List
+from urllib.parse import quote, quote_plus
 
 import httpx
+
+if TYPE_CHECKING:  # pragma: no cover - только для типов
+    from playwright.async_api import BrowserContext
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +34,10 @@ HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
 }
 
-PLAYWRIGHT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-
 COOKIE_TTL_SECONDS = 6 * 60 * 60
 COOKIE_FILE = Path("data/wb_cookies.json")
+PLAYWRIGHT_STORAGE_FILE = Path("/data/pw-storage.json")
+HTML_SETTLE_MS = 800
 
 START_LIMIT = 20
 MAX_CATALOG_ATTEMPTS = 2
@@ -60,9 +60,6 @@ USER_AGENTS = [
 WB_REGIONS = "80,64,38,4,115,83,33,68,70,86,75,30,40,48,69,22,66,31,1,114"
 DESTS = [-1257786, -1069100, -1044448]
 SPPS = [30, 0]
-
-NM_RE = re.compile(r'data-nm-id="(\d+)"')
-
 
 def url_catalog(query: str, page: int, limit: int, dest: int, spp: int) -> str:
     return (
@@ -91,7 +88,7 @@ def url_catalog_alt(query: str, page: int, limit: int, dest: int, spp: int) -> s
 def url_html_search(query: str, page: int) -> str:
     return (
         "https://www.wildberries.ru/catalog/0/search.aspx"
-        f"?search={quote_plus(query)}&page={page}"
+        f"?search={quote(query)}&page={page}"
     )
 
 
@@ -205,6 +202,15 @@ class WildberriesClient:
         self._cookie_cache: list[dict[str, Any]] | None = None
         self._cookie_cache_ts: float | None = None
         self._cookie_lock = asyncio.Lock()
+        self._storage_state_file = PLAYWRIGHT_STORAGE_FILE
+        self._html_settle_ms = HTML_SETTLE_MS
+        self._playwright_headless = True
+        self._playwright_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+        self._playwright_manager = None
+        self._browser = None
+        self._browser_context = None
+        self._browser_lock = asyncio.Lock()
+        self._html_context_user_agent: str | None = None
 
     @staticmethod
     def _detect_http2_support() -> bool:
@@ -217,6 +223,11 @@ class WildberriesClient:
             )
             return False
         return True
+
+    def _pick_user_agent(self) -> str:
+        if self._user_agent_locked:
+            return self._headers.get("User-Agent", USER_AGENTS[0])
+        return random.choice(USER_AGENTS)
 
     async def search_products(
         self,
@@ -559,36 +570,154 @@ class WildberriesClient:
         if delay and delay > 0:
             await asyncio.sleep(delay)
 
-    async def _get_html_cookies(self, *, force_refresh: bool = False) -> list[dict[str, Any]]:
-        async with self._cookie_lock:
-            now = time.time()
-            if not force_refresh:
-                if (
-                    self._cookie_cache is not None
-                    and self._cookie_cache_ts is not None
-                    and now - self._cookie_cache_ts < self._cookie_ttl
-                ):
-                    logger.info(
-                        "[WB/Playwright] Использую сохранённые cookies (in-memory %s)",
-                        len(self._cookie_cache),
-                    )
-                    return list(self._cookie_cache)
+    def _storage_state_is_fresh(self) -> bool:
+        try:
+            stat = self._storage_state_file.stat()
+        except OSError:
+            return False
+        return time.time() - stat.st_mtime < self._cookie_ttl
 
+    async def _ensure_browser_context(
+        self, *, force_refresh: bool = False
+    ) -> "BrowserContext":
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            logger.error(
+                "Playwright не установлен. Установите 'playwright' и выполните 'playwright install chromium'."
+            )
+            raise
+
+        async with self._browser_lock:
+            now = time.time()
+            if force_refresh:
+                await self._close_browser_context_locked()
+
+            if self._browser_context is not None:
+                return self._browser_context
+
+            if self._playwright_manager is None:
+                self._playwright_manager = await async_playwright().start()
+
+            if self._browser is None:
+                self._browser = await self._playwright_manager.chromium.launch(
+                    headless=self._playwright_headless,
+                    args=self._playwright_args,
+                )
+
+            storage_state_arg: str | None = None
+            cookie_source: str | None = None
+            if (
+                self._cookie_cache is not None
+                and self._cookie_cache_ts is not None
+                and now - self._cookie_cache_ts < self._cookie_ttl
+                and self._storage_state_is_fresh()
+            ):
+                storage_state_arg = str(self._storage_state_file)
+                cookie_source = f"in-memory {len(self._cookie_cache)}"
+            else:
                 cookies, ts = await self._load_cookies_from_disk()
-                if cookies is not None and ts is not None and now - ts < self._cookie_ttl:
+                if (
+                    cookies is not None
+                    and ts is not None
+                    and now - ts < self._cookie_ttl
+                    and self._storage_state_is_fresh()
+                ):
                     self._cookie_cache = cookies
                     self._cookie_cache_ts = ts
-                    logger.info(
-                        "[WB/Playwright] Использую сохранённые cookies (file %s)", len(cookies)
-                    )
-                    return list(cookies)
+                    storage_state_arg = str(self._storage_state_file)
+                    cookie_source = f"file {len(cookies)}"
 
-            logger.info("[WB/Playwright] Обновление cookies из браузера")
-            cookies = await self._warm_up_browser_session()
-            self._cookie_cache = cookies
+            user_agent = self._pick_user_agent()
+            context_kwargs = {
+                "user_agent": user_agent,
+                "locale": "ru-RU",
+                "extra_http_headers": {
+                    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                },
+            }
+            if storage_state_arg:
+                context_kwargs["storage_state"] = storage_state_arg
+                logger.info(
+                    "[WB/Playwright] Использую сохранённые cookies (%s)",
+                    cookie_source,
+                )
+            else:
+                logger.info("[WB/Playwright] Запуск нового браузерного контекста")
+
+            self._browser_context = await self._browser.new_context(**context_kwargs)
+            self._html_context_user_agent = user_agent
+
+            if storage_state_arg:
+                await self._persist_browser_state(self._browser_context)
+            else:
+                await self._initialize_browser_context(self._browser_context)
+
+            return self._browser_context
+
+    async def _initialize_browser_context(self, context: "BrowserContext") -> None:
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+        page = await context.new_page()
+        page.set_default_navigation_timeout(20000)
+        page.set_default_timeout(10000)
+        try:
+            await page.goto("https://www.wildberries.ru/", wait_until="domcontentloaded")
+            await page.wait_for_timeout(self._html_settle_ms)
+        except PlaywrightTimeoutError as exc:
+            logger.warning("[WB/Playwright] Таймаут при первичном заходе: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[WB/Playwright] Ошибка при первичном заходе: %s", exc)
+        finally:
+            try:
+                await page.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        await self._persist_browser_state(context)
+
+    async def _persist_browser_state(self, context: "BrowserContext") -> None:
+        await self._update_cookie_cache_from_context(context)
+        storage_path = self._storage_state_file
+        try:
+            storage_path.parent.mkdir(parents=True, exist_ok=True)
+            await context.storage_state(path=str(storage_path))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[WB/Playwright] Не удалось сохранить storage_state: %s", exc)
+
+    async def _update_cookie_cache_from_context(
+        self, context: "BrowserContext"
+    ) -> None:
+        async with self._cookie_lock:
+            try:
+                cookies = await context.cookies()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[WB/Playwright] Не удалось получить cookies: %s", exc)
+                return
+
+            filtered = self._filter_cookies(cookies)
+            self._cookie_cache = filtered
             self._cookie_cache_ts = time.time()
-            await self._save_cookies_to_disk(cookies)
-            return list(cookies)
+            await self._save_cookies_to_disk(filtered)
+
+    async def _close_browser_context_locked(self) -> None:
+        if self._browser_context is not None:
+            try:
+                await self._browser_context.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[WB/Playwright] Ошибка закрытия контекста: %s", exc)
+            self._browser_context = None
+
+        if self._browser is not None:
+            try:
+                await self._browser.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[WB/Playwright] Ошибка закрытия браузера: %s", exc)
+            self._browser = None
+
+        self._html_context_user_agent = None
 
     async def _load_cookies_from_disk(self) -> tuple[list[dict[str, Any]] | None, float | None]:
         def _load() -> tuple[list[dict[str, Any]] | None, float | None]:
@@ -629,32 +758,6 @@ class WildberriesClient:
             ", ".join(names),
         )
 
-    async def _warm_up_browser_session(self) -> list[dict[str, Any]]:
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError as exc:
-            logger.error(
-                "Playwright не установлен. Установите 'playwright' и выполните 'playwright install chromium'."
-            )
-            raise
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                locale="ru-RU",
-                user_agent=PLAYWRIGHT_USER_AGENT,
-            )
-            page = await context.new_page()
-            await page.goto("https://www.wildberries.ru/", wait_until="networkidle")
-            await page.wait_for_load_state("networkidle")
-            await asyncio.sleep(1.0)
-            cookies = await context.cookies()
-            await context.close()
-            await browser.close()
-
-        filtered = self._filter_cookies(cookies)
-        return filtered
-
     def _filter_cookies(self, cookies: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
         filtered: list[dict[str, Any]] = []
         for cookie in cookies:
@@ -677,21 +780,6 @@ class WildberriesClient:
                 }
             )
         return filtered
-
-    def _apply_cookies_to_client(
-        self, client: httpx.AsyncClient, cookies: Sequence[Mapping[str, Any]]
-    ) -> None:
-        jar = httpx.Cookies()
-        for cookie in cookies:
-            name = cookie.get("name")
-            value = cookie.get("value")
-            if not name or value is None:
-                continue
-            domain = cookie.get("domain") or ".wildberries.ru"
-            path = cookie.get("path") or "/"
-            jar.set(name, value, domain=domain, path=path)
-        client.cookies.clear()
-        client.cookies.update(jar)
 
     @property
     def last_page_logs(self) -> list[dict[str, Any]]:
@@ -731,7 +819,7 @@ class WildberriesClient:
         self._last_page_logs.append(summary)
 
         extra_parts: list[str] = []
-        if page_meta.source == "html_detail":
+        if page_meta.source in {"html_xhr", "html_dom"}:
             if page_meta.html_ids is not None:
                 extra_parts.append(f"ids={page_meta.html_ids}")
             if page_meta.html_enriched is not None:
@@ -981,40 +1069,144 @@ class WildberriesClient:
         encountered_429: bool,
         start_time: float,
     ) -> PageFetchMeta:
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
         html_url = url_html_search(query, page)
-        html_headers = dict(headers)
-        cookies = await self._get_html_cookies()
-        if cookies:
-            self._apply_cookies_to_client(client, cookies)
+        nm_ids: list[int] = []
+        source = "html_xhr"
+        context_used: BrowserContext | None = None
 
-        response, saw_429 = await self._request_with_backoff(
-            client,
-            "GET",
-            html_url,
-            headers=html_headers,
-            timeout=timeout,
-        )
-        if response is not None and response.status_code in {403, 498}:
-            cookies = await self._get_html_cookies(force_refresh=True)
-            if cookies:
-                self._apply_cookies_to_client(client, cookies)
-            response, saw_429 = await self._request_with_backoff(
-                client,
-                "GET",
-                html_url,
-                headers=html_headers,
-                timeout=timeout,
-            )
-        encountered_429 = encountered_429 or saw_429
-        status = response.status_code if response else None
-        ids: list[int] = []
-        if response is not None:
-            ids = [int(match) for match in NM_RE.findall(response.text)][:MAX_HTML_IDS]
+        for attempt in range(2):
+            force_refresh = attempt == 1
+            try:
+                context = await self._ensure_browser_context(force_refresh=force_refresh)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("[WB/Playwright] Не удалось подготовить контекст: %s", exc)
+                continue
 
-        if not ids:
+            context_used = context
+            page_obj = await context.new_page()
+            page_obj.set_default_navigation_timeout(20000)
+            page_obj.set_default_timeout(10000)
+
+            responses: list[dict[str, Any]] = []
+
+            async def on_response(resp) -> None:  # type: ignore[no-untyped-def]
+                try:
+                    url_value = resp.url
+                    if "search" not in url_value:
+                        return
+                    if not (
+                        "wildberries.ru" in url_value or "wb.ru" in url_value
+                    ):
+                        return
+                    headers_map = resp.headers or {}
+                    content_type = headers_map.get("content-type", "")
+                    if resp.status == 200 and "application/json" in content_type:
+                        payload = await resp.json()
+                        data = payload.get("data") if isinstance(payload, Mapping) else None
+                        products = data.get("products") if isinstance(data, Mapping) else None
+                        if isinstance(products, Sequence) and products:
+                            responses.append(payload)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            page_obj.on("response", on_response)
+            should_retry = False
+
+            try:
+                goto_response = await page_obj.goto(
+                    html_url,
+                    wait_until="domcontentloaded",
+                )
+                if goto_response and goto_response.status in {403, 498}:
+                    logger.warning(
+                        "[WB/Playwright] Ответ %s на HTML-странице, пробуем обновить контекст",
+                        goto_response.status,
+                    )
+                    should_retry = True
+                else:
+                    await page_obj.wait_for_timeout(self._html_settle_ms)
+
+                    collected: list[int] = []
+                    for payload in responses:
+                        data = payload.get("data") if isinstance(payload, Mapping) else None
+                        products = data.get("products") if isinstance(data, Mapping) else None
+                        if not isinstance(products, Sequence):
+                            continue
+                        for raw in products:
+                            if not isinstance(raw, Mapping):
+                                continue
+                            try:
+                                nm_id = int(raw.get("id"))
+                            except (TypeError, ValueError):
+                                continue
+                            collected.append(nm_id)
+
+                    nm_ids = list(dict.fromkeys(collected))
+                    if nm_ids:
+                        source = "html_xhr"
+                    else:
+                        try:
+                            await page_obj.wait_for_selector(
+                                "a.product-card__link, a.product-card__main",
+                                timeout=3000,
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                        links = await page_obj.eval_on_selector_all(
+                            'a[href*="/catalog/"][href$="/detail.aspx"]',
+                            "els => els.map(a => a.href)",
+                        )
+                        dom_ids: list[int] = []
+                        if isinstance(links, Sequence):
+                            for link in links:
+                                if not isinstance(link, str):
+                                    continue
+                                match = re.search(r"/catalog/(\d+)/detail\.aspx", link)
+                                if not match:
+                                    continue
+                                try:
+                                    dom_ids.append(int(match.group(1)))
+                                except (TypeError, ValueError):
+                                    continue
+                        if dom_ids:
+                            nm_ids = list(dict.fromkeys(dom_ids))
+                            source = "html_dom"
+                        else:
+                            nm_ids = []
+            except PlaywrightTimeoutError as exc:
+                logger.warning("[WB/Playwright] Таймаут на HTML-странице: %s", exc)
+                should_retry = True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[WB/Playwright] Ошибка при загрузке HTML-страницы: %s", exc)
+                should_retry = True
+            finally:
+                try:
+                    page_obj.off("response", on_response)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    await page_obj.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            if should_retry and attempt == 0:
+                nm_ids = []
+                continue
+
+            break
+
+        if context_used is not None:
+            await self._persist_browser_state(context_used)
+
+        nm_ids = nm_ids[:MAX_HTML_IDS]
+
+        if not nm_ids:
             return PageFetchMeta(
                 products=[],
-                source="html_detail",
+                source=source,
                 url=html_url,
                 dest=None,
                 spp=None,
@@ -1028,7 +1220,7 @@ class WildberriesClient:
             )
 
         detail_map = await self._fetch_details(
-            ids,
+            nm_ids,
             timeout=timeout,
             headers=headers,
             client=client,
@@ -1036,7 +1228,7 @@ class WildberriesClient:
 
         enriched: list[dict[str, Any]] = []
         enriched_count = 0
-        for nm_id in ids:
+        for nm_id in nm_ids:
             detail = detail_map.get(nm_id)
             if isinstance(detail, Mapping):
                 detail_copy = dict(detail)
@@ -1054,20 +1246,18 @@ class WildberriesClient:
             else:
                 enriched.append({"id": nm_id})
 
-        status_label = "html_ok/detail_ok" if enriched_count else "html_ok/detail_empty"
-
         return PageFetchMeta(
             products=enriched,
-            source="html_detail",
+            source=source,
             url=html_url,
             dest=None,
             spp=None,
-            status=status_label,
+            status="ok",
             cache="miss",
             had_429=encountered_429,
             limit=limit,
             timing_ms=(time.monotonic() - start_time) * 1000,
-            html_ids=len(ids),
+            html_ids=len(nm_ids),
             html_enriched=enriched_count,
         )
 
