@@ -27,8 +27,10 @@ HEADERS = {
 
 
 def wb_catalog_url(query: str, page: int = 1, limit: int = 100) -> str:
+    """Возвращает корректный JSON-эндпоинт каталога без .aspx."""
+
     return (
-        "https://catalog.wb.ru/catalog/0/search.aspx"
+        "https://catalog.wb.ru/catalog/0/search"
         f"?appType=1&curr=rub&dest=-1257786&spp=30"
         f"&page={page}&limit={limit}&query={quote_plus(query)}"
     )
@@ -341,7 +343,8 @@ class WildberriesClient:
             catalog_url,
             timeout=timeout,
         )
-        products, preview = self._parse_products(response)
+        products = self._parse_products(response, catalog_url, "catalog")
+        preview = products[0] if products else None
         self._log_page("catalog", catalog_url, response, products, preview)
 
         if response.status_code == 200 and products:
@@ -353,17 +356,30 @@ class WildberriesClient:
             exact_url,
             timeout=timeout,
         )
-        fallback_products, fallback_preview = self._parse_products(fallback_response)
+        fallback_products = self._parse_products(
+            fallback_response,
+            exact_url,
+            "exactmatch",
+        )
+        fallback_preview = fallback_products[0] if fallback_products else None
         self._log_page(
-            "exactmatch", exact_url, fallback_response, fallback_products, fallback_preview
+            "exactmatch",
+            exact_url,
+            fallback_response,
+            fallback_products,
+            fallback_preview,
         )
 
         if fallback_response.status_code == 200 and fallback_products:
             return "exactmatch", fallback_response.status_code, fallback_products
 
-        status = fallback_response.status_code if fallback_response is not None else response.status_code
+        status = (
+            fallback_response.status_code
+            if fallback_response is not None
+            else response.status_code
+        )
         logger.info(
-            "WB поиск (empty): %s -> статус %s, товаров на странице: %s",
+            "WB поиск (empty): %s -> статус %s, товаров: %s",
             exact_url,
             status,
             len(fallback_products or []),
@@ -404,31 +420,35 @@ class WildberriesClient:
         raise RuntimeError("Не удалось выполнить запрос к Wildberries")
 
     def _parse_products(
-        self, response: httpx.Response
-    ) -> tuple[list[Mapping[str, Any]], Mapping[str, Any] | None]:
+        self,
+        response: httpx.Response,
+        url: str,
+        source: str,
+    ) -> list[Mapping[str, Any]]:
+        """Пытаемся разобрать JSON-ответ Wildberries с защитой от HTML-ошибок."""
+
         try:
             payload = response.json()
-        except ValueError:
-            logger.exception(
-                "Не удалось разобрать JSON Wildberries (url=%s)",
-                getattr(response.request, "url", "unknown"),
+        except Exception:
+            logger.error(
+                "WB вернул не-JSON (%s %s). Статус: %s. Тело (первые 200 символов): %r",
+                source,
+                url,
+                response.status_code,
+                (response.text or "")[:200],
             )
-            return [], None
+            return []
 
-        products_data = payload.get("data", {}).get("products")
+        data = payload.get("data")
+        if not isinstance(data, Mapping):
+            return []
+
+        products_data = data.get("products")
         if isinstance(products_data, list):
-            products_list = [
-                item for item in products_data if isinstance(item, Mapping)
-            ]
-        elif isinstance(products_data, Iterable):
-            products_list = [
-                item for item in products_data if isinstance(item, Mapping)
-            ]
-        else:
-            products_list = []
-
-        preview = products_list[0] if products_list else None
-        return products_list, preview
+            return [item for item in products_data if isinstance(item, Mapping)]
+        if isinstance(products_data, Iterable):
+            return [item for item in products_data if isinstance(item, Mapping)]
+        return []
 
     def _log_page(
         self,
@@ -440,7 +460,7 @@ class WildberriesClient:
     ) -> None:
         status = response.status_code if response is not None else None
         logger.info(
-            "WB поиск (%s): %s -> статус %s, товаров на странице: %s",
+            "WB поиск (%s): %s -> статус %s, товаров: %s",
             source,
             url,
             status,

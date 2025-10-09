@@ -78,19 +78,30 @@ async def _run(args: argparse.Namespace) -> None:
             print(f"  image: {product.image_url}")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Проверка поискового клиента Wildberries")
-    parser.add_argument("query", help="Поисковый запрос")
-    parser.add_argument("--min", help="Минимальная цена в рублях", default=None)
-    parser.add_argument("--max", help="Максимальная цена в рублях", default=None)
-    parser.add_argument("--limit", type=int, default=None, help="Количество результатов")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Проверка поискового клиента Wildberries",
+    )
+    parser.add_argument("--query", required=True, help="поисковый запрос")
+    parser.add_argument("--min", default=None, help="минимальная цена в рублях")
+    parser.add_argument("--max", default=None, help="максимальная цена в рублях")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="количество результатов",
+    )
     parser.add_argument(
         "--banned",
         nargs="*",
         default=None,
-        help="Список стоп-слов, которые нужно исключить",
+        help="список стоп-слов, которые нужно исключить",
     )
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
     asyncio.run(_run(args))
 
 
