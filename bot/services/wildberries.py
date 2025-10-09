@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import logging
+import random
 import re
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, List
@@ -24,7 +26,20 @@ HEADERS = {
     "Accept-Language": "ru,en;q=0.9",
     "Referer": "https://www.wildberries.ru/",
     "Connection": "keep-alive",
+    "Accept-Encoding": "gzip, deflate, br",
 }
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+]
 
 WB_REGIONS = "80,64,38,4,115,83,33,68,70,86,75,30,40,48,69,22,66,31,1,114"
 DESTS = [-1257786, -1069100, -1044448]
@@ -119,6 +134,20 @@ class Product:
     score: float | None = None
 
 
+@dataclass(slots=True)
+class PageFetchMeta:
+    products: list[dict[str, Any]]
+    source: str
+    url: str
+    dest: int | None
+    spp: int | None
+    status: int | str | None
+    cache: str
+    had_429: bool
+    limit: int
+    timing_ms: float
+
+
 class WildberriesClient:
     """Client for fetching products from Wildberries search API."""
 
@@ -130,15 +159,27 @@ class WildberriesClient:
         min_rating: float | None = None,
         min_feedbacks: int | None = None,
         min_discount: float | None = None,
+        page_delay_ms: float | None = None,
     ) -> None:
         self._timeout = timeout
         self._headers = dict(HEADERS)
         if user_agent:
             self._headers["User-Agent"] = user_agent
+        self._user_agent_locked = bool(user_agent)
         self._http2_enabled = self._detect_http2_support()
         self._min_rating = min_rating
         self._min_feedbacks = min_feedbacks
         self._min_discount = min_discount
+        self._cache: dict[
+            tuple[Any, ...],
+            tuple[float, int | None, str, str, tuple[dict[str, Any], ...]],
+        ] = {}
+        self._cache_ttl = 45.0
+        self._last_page_logs: list[dict[str, Any]] = []
+        self._page_delay_override = (
+            float(page_delay_ms) / 1000 if page_delay_ms is not None else None
+        )
+        self._page_delay_range = (0.15, 0.35)
 
     @staticmethod
     def _detect_http2_support() -> bool:
@@ -163,26 +204,10 @@ class WildberriesClient:
     ) -> List[Product]:
         if max_results <= 0:
             return []
+        self._last_page_logs = []
 
-        min_price_rub: int | None = None
-        if min_price is not None:
-            try:
-                min_candidate = int(min_price)
-            except (TypeError, ValueError):
-                min_candidate = None
-            else:
-                min_candidate = max(min_candidate, 0)
-                min_price_rub = min_candidate or None
-
-        max_price_rub: int | None = None
-        if max_price not in (None, 0):
-            try:
-                max_candidate = int(max_price)
-            except (TypeError, ValueError):
-                max_candidate = None
-            else:
-                max_candidate = max(max_candidate, 0)
-                max_price_rub = max_candidate or None
+        min_price_rub = self._normalize_price(min_price)
+        max_price_rub = self._normalize_price(max_price)
 
         if (
             min_price_rub is not None
@@ -204,46 +229,41 @@ class WildberriesClient:
         filtered_by_feedbacks = 0
         filtered_by_discount = 0
         total_received = 0
+        consecutive_empty_pages = 0
+        rate_limit_hits = 0
 
         effective_timeout = float(timeout or self._timeout)
+        current_limit = 100
+
+        session_headers = dict(self._headers)
+        if not self._user_agent_locked:
+            session_headers["User-Agent"] = random.choice(USER_AGENTS)
+        session_headers.setdefault("Accept-Encoding", HEADERS["Accept-Encoding"])
 
         async with httpx.AsyncClient(
             timeout=effective_timeout,
-            headers=self._headers,
+            headers=session_headers,
             follow_redirects=True,
             http2=self._http2_enabled,
         ) as client:
             page = 1
 
             while len(filtered_candidates) < max_results:
-                (
-                    page_products,
-                    source,
-                    _url,
-                    used_dest,
-                    used_spp,
-                ) = await self._fetch_page(
+                page_meta = await self._fetch_page(
                     client,
+                    headers=session_headers,
                     query=query,
                     page=page,
-                    limit=100,
+                    limit=current_limit,
                     timeout=effective_timeout,
                 )
 
-                raw_products = page_products or []
+                raw_products = page_meta.products or []
                 products_list: list[dict[str, Any]] = [
                     item if isinstance(item, dict) else dict(item)
                     for item in raw_products
                 ]
                 total_received += len(products_list)
-
-                if not products_list:
-                    break
-
-                await self._enrich_products_from_details(
-                    products_list,
-                    timeout=effective_timeout,
-                )
 
                 before_count = len(products_list)
                 page_price_filtered = 0
@@ -251,6 +271,74 @@ class WildberriesClient:
                 page_rating_filtered = 0
                 page_feedback_filtered = 0
                 page_discount_filtered = 0
+
+                if not products_list:
+                    consecutive_empty_pages += 1
+                    page_summary = {
+                        "page": page,
+                        "source": page_meta.source,
+                        "status": page_meta.status,
+                        "products": 0,
+                        "limit": page_meta.limit,
+                        "dest": page_meta.dest,
+                        "spp": page_meta.spp,
+                        "cache": page_meta.cache,
+                        "timing_ms": page_meta.timing_ms,
+                        "before": 0,
+                        "after_price": 0,
+                        "after_banned": 0,
+                        "after_quality": 0,
+                        "total_so_far": len(filtered_candidates),
+                        "top_items": [],
+                    }
+                    self._last_page_logs.append(page_summary)
+                    logger.info(
+                        "page=%s source=%s status=%s products=%s limit=%s dest=%s "
+                        "spp=%s cache=%s timing=%.0fms",
+                        page,
+                        page_meta.source,
+                        page_meta.status,
+                        0,
+                        page_meta.limit,
+                        page_meta.dest,
+                        page_meta.spp,
+                        page_meta.cache,
+                        page_meta.timing_ms,
+                    )
+                    logger.info(
+                        "filters: before=%s after_price=%s after_banned=%s "
+                        "after_quality=%s total_so_far=%s",
+                        0,
+                        0,
+                        0,
+                        0,
+                        len(filtered_candidates),
+                    )
+
+                    if page_meta.had_429:
+                        rate_limit_hits += 1
+                        current_limit = self._adjust_limit_on_rate_limit(
+                            current_limit,
+                            rate_limit_hits,
+                        )
+
+                    if consecutive_empty_pages >= 2:
+                        break
+
+                    if total_received >= max(100, max_results * 2):
+                        break
+
+                    page += 1
+                    await self._sleep_between_pages()
+                    continue
+
+                consecutive_empty_pages = 0
+
+                await self._enrich_products_from_details(
+                    products_list,
+                    timeout=effective_timeout,
+                    headers=session_headers,
+                )
 
                 page_candidates: list[dict[str, Any]] = []
                 for item in products_list:
@@ -334,13 +422,56 @@ class WildberriesClient:
                 after_banned_count = after_price_count - page_banned_filtered
                 after_quality_count = len(page_candidates)
 
+                top_items: list[dict[str, Any]] = []
+                for candidate in page_candidates[:3]:
+                    candidate_item = candidate.get("item", {})
+                    try:
+                        candidate_id = int(candidate_item.get("id"))
+                    except (TypeError, ValueError):
+                        continue
+                    top_items.append(
+                        {
+                            "id": candidate_id,
+                            "price": candidate.get("price_rub"),
+                            "url": f"https://www.wildberries.ru/catalog/{candidate_id}/detail.aspx",
+                        }
+                    )
+
+                page_summary = {
+                    "page": page,
+                    "source": page_meta.source,
+                    "status": page_meta.status,
+                    "products": before_count,
+                    "limit": page_meta.limit,
+                    "dest": page_meta.dest,
+                    "spp": page_meta.spp,
+                    "cache": page_meta.cache,
+                    "timing_ms": page_meta.timing_ms,
+                    "before": before_count,
+                    "after_price": after_price_count,
+                    "after_banned": after_banned_count,
+                    "after_quality": after_quality_count,
+                    "total_so_far": len(filtered_candidates),
+                    "top_items": top_items,
+                }
+                self._last_page_logs.append(page_summary)
+
                 logger.info(
-                    "Страница %s (%s, dest=%s, spp=%s): before=%s after_price=%s "
-                    "after_banned=%s after_quality=%s total=%s",
+                    "page=%s source=%s status=%s products=%s limit=%s dest=%s "
+                    "spp=%s cache=%s timing=%.0fms",
                     page,
-                    source,
-                    used_dest,
-                    used_spp,
+                    page_meta.source,
+                    page_meta.status,
+                    before_count,
+                    page_meta.limit,
+                    page_meta.dest,
+                    page_meta.spp,
+                    page_meta.cache,
+                    page_meta.timing_ms,
+                )
+                logger.info(
+                    "filters: before=%s after_price=%s after_banned=%s "
+                    "after_quality=%s total_so_far=%s",
                     before_count,
                     after_price_count,
                     after_banned_count,
@@ -348,10 +479,21 @@ class WildberriesClient:
                     len(filtered_candidates),
                 )
 
+                if page_meta.had_429:
+                    rate_limit_hits += 1
+                    current_limit = self._adjust_limit_on_rate_limit(
+                        current_limit,
+                        rate_limit_hits,
+                    )
+
                 if len(filtered_candidates) >= max_results:
                     break
 
+                if total_received >= max(100, max_results * 2):
+                    break
+
                 page += 1
+                await self._sleep_between_pages()
 
         if not filtered_candidates:
             reason_parts = []
@@ -392,6 +534,7 @@ class WildberriesClient:
         detail_map = await self._fetch_details(
             (int(candidate["item"]["id"]) for candidate in limited_candidates),
             timeout=effective_timeout,
+            headers=session_headers,
         )
 
         products: List[Product] = []
@@ -416,42 +559,135 @@ class WildberriesClient:
 
         return products
 
+    @staticmethod
+    def _normalize_price(value: Any) -> int | None:
+        if value in (None, ""):
+            return None
+        try:
+            candidate = int(value)
+        except (TypeError, ValueError):
+            return None
+        if candidate <= 0:
+            return None
+        return candidate
+
+    def _adjust_limit_on_rate_limit(self, current_limit: int, rate_limit_hits: int) -> int:
+        if rate_limit_hits == 1 and current_limit > 30:
+            logger.warning(
+                "WB ответил 429: уменьшаем лимит страницы до %s",
+                30,
+            )
+            return 30
+        if rate_limit_hits >= 2 and current_limit > 20:
+            logger.warning(
+                "Повторный 429: уменьшаем лимит страницы до %s",
+                20,
+            )
+            return 20
+        return current_limit
+
+    async def _sleep_between_pages(self) -> None:
+        delay = (
+            self._page_delay_override
+            if self._page_delay_override is not None
+            else random.uniform(*self._page_delay_range)
+        )
+        if delay and delay > 0:
+            await asyncio.sleep(delay)
+
+    @property
+    def last_page_logs(self) -> list[dict[str, Any]]:
+        return [dict(entry) for entry in self._last_page_logs]
+
+    def _cache_key(
+        self, query: str, page: int, limit: int, dest: int, spp: int
+    ) -> tuple[Any, ...]:
+        return (query.lower(), page, limit, dest, spp)
+
+    def _cache_get(
+        self, key: tuple[Any, ...]
+    ) -> tuple[int | None, str, str, list[dict[str, Any]]] | None:
+        entry = self._cache.get(key)
+        if not entry:
+            return None
+        timestamp, status, label, url, payload = entry
+        if time.monotonic() - timestamp > self._cache_ttl:
+            self._cache.pop(key, None)
+            return None
+        return status, label, url, [dict(item) for item in payload]
+
+    def _cache_set(
+        self,
+        key: tuple[Any, ...],
+        *,
+        status: int | None,
+        label: str,
+        url: str,
+        payload: list[dict[str, Any]],
+    ) -> None:
+        self._cache[key] = (
+            time.monotonic(),
+            status,
+            label,
+            url,
+            tuple(dict(item) for item in payload),
+        )
+
     async def _fetch_page(
         self,
         client: httpx.AsyncClient,
         *,
+        headers: Mapping[str, str],
         query: str,
         page: int,
         limit: int,
         timeout: float,
-    ) -> tuple[list[dict[str, Any]], str, str, int | None, int | None]:
+    ) -> PageFetchMeta:
+        encountered_429 = False
+        start_time = time.monotonic()
+
         for dest in DESTS:
             for spp in SPPS:
+                key = self._cache_key(query, page, limit, dest, spp)
+                cached = self._cache_get(key)
+                if cached:
+                    status, label, cached_url, payload = cached
+                    return PageFetchMeta(
+                        products=payload,
+                        source=label,
+                        url=cached_url,
+                        dest=dest,
+                        spp=spp,
+                        status=status,
+                        cache="hit",
+                        had_429=False,
+                        limit=limit,
+                        timing_ms=(time.monotonic() - start_time) * 1000,
+                    )
+
                 for builder, label in (
                     (url_catalog, "catalog"),
                     (url_catalog_alt, "catalog_alt"),
                     (url_exactmatch, "exactmatch"),
                 ):
                     url = builder(query, page, limit, dest, spp)
-                    for attempt in range(1, 4):
-                        try:
-                            response = await client.get(url, timeout=timeout)
-                        except (httpx.ReadTimeout, httpx.ConnectError) as exc:
-                            logger.warning(
-                                "WB %s attempt %s failed: %s",
-                                label,
-                                attempt,
-                                exc,
-                            )
-                            await asyncio.sleep(0.3)
-                            continue
-
+                    response, saw_429 = await self._request_with_backoff(
+                        client,
+                        "GET",
+                        url,
+                        headers=headers,
+                        timeout=timeout,
+                    )
+                    encountered_429 = encountered_429 or saw_429
+                    status = response.status_code if response else None
+                    products: list[dict[str, Any]] = []
+                    if response is not None:
                         products = parse_products_json(response, url, label)
                         logger.info(
                             "WB запрос (%s): %s -> %s, products=%s (dest=%s,spp=%s)",
                             label,
                             url,
-                            response.status_code,
+                            status,
                             len(products),
                             dest,
                             spp,
@@ -471,37 +707,223 @@ class WildberriesClient:
                                 price_u,
                                 price_rub_preview,
                             )
-                            return products, label, url, dest, spp
+                            self._cache_set(
+                                key,
+                                status=status,
+                                label=label,
+                                url=url,
+                                payload=products,
+                            )
+                            return PageFetchMeta(
+                                products=[dict(item) for item in products],
+                                source=label,
+                                url=url,
+                                dest=dest,
+                                spp=spp,
+                                status=status,
+                                cache="miss",
+                                had_429=encountered_429,
+                                limit=limit,
+                                timing_ms=(time.monotonic() - start_time) * 1000,
+                            )
 
-                        if response.status_code == 200:
-                            break
+                    if response is not None and status and 200 <= status < 300:
+                        break
 
+        return await self._html_fallback(
+            client,
+            headers=headers,
+            query=query,
+            page=page,
+            limit=limit,
+            timeout=timeout,
+            encountered_429=encountered_429,
+            start_time=start_time,
+        )
+
+    async def _html_fallback(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        headers: Mapping[str, str],
+        query: str,
+        page: int,
+        limit: int,
+        timeout: float,
+        encountered_429: bool,
+        start_time: float,
+    ) -> PageFetchMeta:
         html_url = url_html_search(query, page)
         html_headers = {
-            "User-Agent": self._headers.get("User-Agent", HEADERS["User-Agent"]),
+            "User-Agent": headers.get("User-Agent", HEADERS["User-Agent"]),
             "Referer": "https://www.wildberries.ru/",
+            "Accept-Language": headers.get("Accept-Language", HEADERS["Accept-Language"]),
         }
-        try:
-            response = await client.get(html_url, headers=html_headers, timeout=timeout)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("WB HTML fallback error: %s", exc)
-            return [], "empty", html_url, None, None
-
-        ids = [int(match) for match in NM_RE.findall(response.text)]
-        logger.info(
-            "WB HTML fallback: %s -> статус=%s nmIds=%s",
+        response, saw_429 = await self._request_with_backoff(
+            client,
+            "GET",
             html_url,
-            response.status_code,
-            len(ids),
+            headers=html_headers,
+            timeout=timeout,
         )
+        encountered_429 = encountered_429 or saw_429
+        status = response.status_code if response else None
+        ids: list[int] = []
+        if response is not None:
+            ids = [int(match) for match in NM_RE.findall(response.text)][:50]
+            logger.info(
+                "WB HTML fallback: %s -> статус=%s nmIds=%s",
+                html_url,
+                status,
+                len(ids),
+            )
         if not ids:
-            return [], "empty", html_url, None, None
+            return PageFetchMeta(
+                products=[],
+                source="empty",
+                url=html_url,
+                dest=None,
+                spp=None,
+                status=status,
+                cache="miss",
+                had_429=encountered_429,
+                limit=limit,
+                timing_ms=(time.monotonic() - start_time) * 1000,
+            )
 
-        fake_products = [{"id": nm_id} for nm_id in ids]
-        return fake_products, "html", html_url, None, None
+        detail_map = await self._fetch_details(
+            ids,
+            timeout=timeout,
+            headers=headers,
+            client=client,
+        )
+        enriched = []
+        enriched_count = 0
+        for nm_id in ids:
+            detail = detail_map.get(nm_id)
+            if isinstance(detail, Mapping):
+                detail_copy = dict(detail)
+                detail_copy.setdefault("id", nm_id)
+                enriched.append(detail_copy)
+                enriched_count += 1
+            else:
+                enriched.append({"id": nm_id})
+        logger.info(
+            "html_fallback: ids=%s enriched=%s page=%s",
+            len(ids),
+            enriched_count,
+            page,
+        )
+
+        return PageFetchMeta(
+            products=enriched,
+            source="html_detail",
+            url=html_url,
+            dest=None,
+            spp=None,
+            status=status,
+            cache="miss",
+            had_429=encountered_429,
+            limit=limit,
+            timing_ms=(time.monotonic() - start_time) * 1000,
+        )
+
+    async def _request_with_backoff(
+        self,
+        client: httpx.AsyncClient,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        timeout: float,
+        max_retries: int = 6,
+        base_delay: float = 0.5,
+        max_delay: float = 8.0,
+        params: Mapping[str, Any] | None = None,
+    ) -> tuple[httpx.Response | None, bool]:
+        saw_rate_limit = False
+        last_response: httpx.Response | None = None
+        for attempt in range(max_retries):
+            try:
+                response = await client.request(
+                    method,
+                    url,
+                    headers=headers,
+                    timeout=timeout,
+                    params=params,
+                )
+            except (httpx.ReadTimeout, httpx.ConnectError) as exc:
+                sleep_time = min(
+                    base_delay * (2**attempt) + random.uniform(0.1, 0.4),
+                    max_delay,
+                )
+                logger.warning(
+                    "WB запрос ошибка (%s %s) попытка %s/%s: %s, sleep=%.2fs",
+                    method,
+                    url,
+                    attempt + 1,
+                    max_retries,
+                    exc,
+                    sleep_time,
+                )
+                await asyncio.sleep(sleep_time)
+                continue
+
+            last_response = response
+            status = response.status_code
+            if status in {429, 403, 502, 503, 504}:
+                if status == 429:
+                    saw_rate_limit = True
+                retry_after = response.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        sleep_time = max(float(retry_after), 0.0)
+                    except (TypeError, ValueError):
+                        sleep_time = min(
+                            base_delay * (2**attempt) + random.uniform(0.1, 0.4),
+                            max_delay,
+                        )
+                else:
+                    sleep_time = min(
+                        base_delay * (2**attempt) + random.uniform(0.1, 0.4),
+                        max_delay,
+                    )
+                logger.warning(
+                    "WB статус %s (%s) попытка %s/%s, sleep=%.2fs",
+                    status,
+                    url,
+                    attempt + 1,
+                    max_retries,
+                    sleep_time,
+                )
+                await asyncio.sleep(sleep_time)
+                continue
+
+            if 200 <= status < 300:
+                return response, saw_rate_limit
+
+            if attempt == 0:
+                sleep_time = min(base_delay + random.uniform(0.1, 0.4), max_delay)
+                logger.warning(
+                    "WB неожиданный статус %s (%s), повтор через %.2fs",
+                    status,
+                    url,
+                    sleep_time,
+                )
+                await asyncio.sleep(sleep_time)
+                continue
+
+            return response, saw_rate_limit
+
+        return last_response, saw_rate_limit
 
     async def _enrich_products_from_details(
-        self, items: list[dict[str, Any]], *, timeout: float
+        self,
+        items: list[dict[str, Any]],
+        *,
+        timeout: float,
+        headers: Mapping[str, str],
+        client: httpx.AsyncClient | None = None,
     ) -> None:
         missing_ids: list[int] = []
         for item in items:
@@ -525,7 +947,12 @@ class WildberriesClient:
         if not missing_ids:
             return
 
-        detail_map = await self._fetch_details(missing_ids, timeout=timeout)
+        detail_map = await self._fetch_details(
+            missing_ids,
+            timeout=timeout,
+            headers=headers,
+            client=client,
+        )
         for item in items:
             product_id = item.get("id")
             if product_id is None:
@@ -562,7 +989,12 @@ class WildberriesClient:
                     item["priceU"] = extended.get("promoPriceU")
 
     async def _fetch_details(
-        self, product_ids: Iterable[int], *, timeout: float
+        self,
+        product_ids: Iterable[int],
+        *,
+        timeout: float,
+        headers: Mapping[str, str] | None = None,
+        client: httpx.AsyncClient | None = None,
     ) -> Mapping[int, dict[str, Any]]:
         ids = [str(pid) for pid in product_ids]
         if not ids:
@@ -575,18 +1007,53 @@ class WildberriesClient:
             "nm": ",".join(ids),
         }
 
-        async with httpx.AsyncClient(
-            timeout=timeout,
-            headers=self._headers,
-            follow_redirects=True,
-            http2=self._http2_enabled,
-        ) as client:
-            response = await client.get(DETAIL_API_URL, params=params)
-            response.raise_for_status()
+        request_headers = dict(headers or self._headers)
+        request_headers.setdefault("Accept-Encoding", HEADERS["Accept-Encoding"])
+
+        if client is None:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                headers=request_headers,
+                follow_redirects=True,
+                http2=self._http2_enabled,
+            ) as local_client:
+                response, _ = await self._request_with_backoff(
+                    local_client,
+                    "GET",
+                    DETAIL_API_URL,
+                    headers=request_headers,
+                    timeout=timeout,
+                    params=params,
+                )
+        else:
+            response, _ = await self._request_with_backoff(
+                client,
+                "GET",
+                DETAIL_API_URL,
+                headers=request_headers,
+                timeout=timeout,
+                params=params,
+            )
+
+        if response is None:
+            return {}
+
+        try:
             payload = response.json()
+        except Exception:  # noqa: BLE001
+            logger.error(
+                "Не удалось разобрать JSON детализации WB: статус=%s body[:200]=%r",
+                response.status_code,
+                (response.text or "")[:200],
+            )
+            return {}
 
         details = payload.get("data", {}).get("products", [])
-        return {int(item.get("id")): item for item in details if item.get("id") is not None}
+        return {
+            int(item.get("id")): item
+            for item in details
+            if isinstance(item, Mapping) and item.get("id") is not None
+        }
 
     def _build_product(
         self,

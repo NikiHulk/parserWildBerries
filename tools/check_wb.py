@@ -42,6 +42,7 @@ async def _run(args: argparse.Namespace) -> None:
         min_rating=settings.min_rating,
         min_feedbacks=settings.min_feedbacks,
         min_discount=settings.min_discount,
+        page_delay_ms=args.throttle,
     )
 
     banned: List[str] = args.banned or []
@@ -53,6 +54,26 @@ async def _run(args: argparse.Namespace) -> None:
         max_results=args.limit or settings.max_results,
         timeout=settings.request_timeout,
     )
+
+    for summary in client.last_page_logs:
+        print(
+            "page={page} source={source} status={status} products={products} "
+            "limit={limit} dest={dest} spp={spp} cache={cache} timing={timing:.0f}ms".format(
+                page=summary.get("page"),
+                source=summary.get("source"),
+                status=summary.get("status"),
+                products=summary.get("products"),
+                limit=summary.get("limit"),
+                dest=summary.get("dest"),
+                spp=summary.get("spp"),
+                cache=summary.get("cache"),
+                timing=summary.get("timing_ms", 0.0),
+            )
+        )
+        for item in (summary.get("top_items") or [])[:3]:
+            price = item.get("price")
+            price_str = f"{price}₽" if price is not None else "n/a"
+            print(f"  {item.get('id')} | {price_str} | {item.get('url')}")
 
     if not products:
         print("Ничего не найдено")
@@ -98,6 +119,12 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=[],
         help="список стоп-слов, которые нужно исключить",
+    )
+    parser.add_argument(
+        "--throttle",
+        type=float,
+        default=None,
+        help="задержка между страницами в миллисекундах",
     )
     return parser.parse_args()
 
