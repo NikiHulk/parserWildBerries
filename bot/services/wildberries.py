@@ -89,6 +89,7 @@ class WildberriesClient:
         self,
         query: str,
         min_price: float = 0.0,
+        max_price: float | None = None,
         limit: int = 10,
         exclude_words: Iterable[str] | None = None,
     ) -> List[Product]:
@@ -100,6 +101,7 @@ class WildberriesClient:
         max_pages = 10
 
         min_price_units = int(min_price * 100)
+        max_price_units = int(max_price * 100) if max_price is not None else None
 
         async with httpx.AsyncClient(
             timeout=self._timeout,
@@ -111,13 +113,14 @@ class WildberriesClient:
                 client,
                 query=query,
                 min_price_units=min_price_units,
+                max_price_units=max_price_units,
                 max_candidates=max_candidates,
                 max_pages=max_pages,
                 excludes=normalized_excludes,
-                use_price_filter=min_price_units > 0,
+                use_price_filter=(min_price_units > 0 or max_price_units is not None),
             )
 
-            if not candidates and min_price_units > 0:
+            if not candidates and (min_price_units > 0 or max_price_units is not None):
                 logger.info(
                     "Серверный фильтр priceU не вернул товаров, повторяем поиск без него"
                 )
@@ -125,6 +128,7 @@ class WildberriesClient:
                     client,
                     query=query,
                     min_price_units=min_price_units,
+                    max_price_units=max_price_units,
                     max_candidates=max_candidates,
                     max_pages=max_pages,
                     excludes=normalized_excludes,
@@ -167,6 +171,7 @@ class WildberriesClient:
         *,
         query: str,
         min_price_units: int,
+        max_price_units: int | None,
         max_candidates: int,
         max_pages: int,
         excludes: list[str],
@@ -185,10 +190,9 @@ class WildberriesClient:
                 "sort": "rate",
                 "page": page,
             }
-            if use_price_filter and min_price_units > 0:
-                # priceU требует верхней границы. Передаём очень большой предел,
-                # чтобы искать только по нижнему порогу и не терять дорогие товары.
-                params["priceU"] = f"{min_price_units};{MAX_PRICE_LIMIT_UNITS}"
+            if use_price_filter:
+                upper_bound = max_price_units if max_price_units is not None else MAX_PRICE_LIMIT_UNITS
+                params["priceU"] = f"{min_price_units};{upper_bound}"
 
             params.update(DEFAULT_SEARCH_PARAMS)
 
@@ -200,7 +204,12 @@ class WildberriesClient:
                 break
 
             for item in products_data:
-                if not self._passes_basic_filters(item, min_price_units, excludes):
+                if not self._passes_basic_filters(
+                    item,
+                    min_price_units=min_price_units,
+                    max_price_units=max_price_units,
+                    excludes=excludes,
+                ):
                     continue
                 candidates.append(item)
                 if len(candidates) >= max_candidates:
@@ -313,13 +322,18 @@ class WildberriesClient:
     @staticmethod
     def _passes_basic_filters(
         item: Mapping[str, Any],
+        *,
         min_price_units: int,
+        max_price_units: int | None,
         excludes: list[str],
     ) -> bool:
         sale_price = WildberriesClient._safe_int(item.get("salePriceU"))
         if sale_price is None:
             sale_price = WildberriesClient._safe_int(item.get("priceU"))
         if sale_price is None or sale_price < min_price_units:
+            return False
+
+        if max_price_units is not None and sale_price > max_price_units:
             return False
 
         if item.get("id") is None:

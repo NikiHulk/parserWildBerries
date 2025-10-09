@@ -24,7 +24,8 @@ router = Router()
 
 class SearchStates(StatesGroup):
     waiting_for_query = State()
-    waiting_for_price = State()
+    waiting_for_min_price = State()
+    waiting_for_max_price = State()
 
 
 @router.message(Command("search"))
@@ -59,7 +60,7 @@ async def process_query(message: Message, state: FSMContext) -> None:
         return
 
     await state.update_data(query=query)
-    await state.set_state(SearchStates.waiting_for_price)
+    await state.set_state(SearchStates.waiting_for_min_price)
     await message.answer(
         "Укажите минимальную цену (в рублях). Например: 1500.\n"
         "Если хотите отменить поиск, нажмите «⬅️ Отмена».",
@@ -68,8 +69,8 @@ async def process_query(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(SearchStates.waiting_for_price)
-async def process_price(
+@router.message(SearchStates.waiting_for_min_price)
+async def process_min_price(
     message: Message,
     state: FSMContext,
     banned_words: BannedWordsService,
@@ -95,8 +96,63 @@ async def process_price(
         )
         return
 
+    await state.update_data(min_price=min_price)
+    await state.set_state(SearchStates.waiting_for_max_price)
+    await message.answer(
+        "Укажите максимальную цену (в рублях). Например: 5000.\n"
+        "Если верхний порог не нужен, отправьте 0 или напишите «Пропустить».",
+        parse_mode=ParseMode.HTML,
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(SearchStates.waiting_for_max_price)
+async def process_max_price(
+    message: Message,
+    state: FSMContext,
+    banned_words: BannedWordsService,
+) -> None:
+    if message.text and message.text.casefold() == CANCEL_BUTTON.casefold():
+        await state.clear()
+        await message.answer(
+            "Поиск отменён. Вы можете выбрать новое действие из меню.",
+            reply_markup=main_menu_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    raw_text = (message.text or "").strip()
+    max_price: float | None
+    if not raw_text:
+        max_price = None
+    else:
+        normalized = raw_text.replace(",", ".")
+        if normalized.casefold() in {"пропустить", "skip"}:
+            max_price = None
+        else:
+            try:
+                parsed = float(normalized)
+                if parsed <= 0:
+                    max_price = None
+                else:
+                    max_price = parsed
+            except ValueError:
+                await message.answer(
+                    "Не удалось понять максимальную цену. Введите число или 0, чтобы пропустить порог.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+
     data = await state.get_data()
     query = data.get("query", "")
+    min_price = float(data.get("min_price", 0))
+
+    if max_price is not None and max_price < min_price:
+        await message.answer(
+            "Максимальная цена не может быть меньше минимальной. Попробуйте ещё раз.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
     settings = get_settings()
     client = WildberriesClient(timeout=settings.request_timeout)
@@ -105,6 +161,7 @@ async def process_price(
         products = await client.search(
             query=query,
             min_price=min_price,
+            max_price=max_price,
             limit=settings.max_results,
             exclude_words=banned_words.list_words(message.from_user.id),
         )
