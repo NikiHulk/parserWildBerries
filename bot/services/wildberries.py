@@ -632,6 +632,8 @@ class WildberriesClient:
             context_kwargs = {
                 "user_agent": user_agent,
                 "locale": "ru-RU",
+                "java_script_enabled": True,
+                "viewport": {"width": 1366, "height": 768},
                 "extra_http_headers": {
                     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
                     "Cache-Control": "no-cache",
@@ -1075,29 +1077,39 @@ class WildberriesClient:
         nm_ids: list[int] = []
         source = "html_xhr"
         context_used: BrowserContext | None = None
+        consecutive_498 = 0
+        force_refresh = False
+        attempt = 0
+        max_attempts = 6
 
-        for attempt in range(2):
-            force_refresh = attempt == 1
+        while attempt < max_attempts:
+            attempt += 1
             try:
                 context = await self._ensure_browser_context(force_refresh=force_refresh)
             except Exception as exc:  # noqa: BLE001
                 logger.error("[WB/Playwright] Не удалось подготовить контекст: %s", exc)
+                force_refresh = True
+                await asyncio.sleep(random.uniform(1.2, 2.4))
                 continue
 
+            force_refresh = False
             context_used = context
             page_obj = await context.new_page()
-            page_obj.set_default_navigation_timeout(20000)
-            page_obj.set_default_timeout(10000)
+            page_obj.set_default_navigation_timeout(30000)
+            page_obj.set_default_timeout(15000)
 
             responses: list[dict[str, Any]] = []
 
             async def on_response(resp) -> None:  # type: ignore[no-untyped-def]
                 try:
                     url_value = resp.url
-                    if "search" not in url_value:
-                        return
                     if not (
-                        "wildberries.ru" in url_value or "wb.ru" in url_value
+                        ("search" in url_value or "catalog" in url_value)
+                        and (
+                            "wbxcatalog-ru" in url_value
+                            or "catalog.wb.ru" in url_value
+                            or "search.wb.ru" in url_value
+                        )
                     ):
                         return
                     headers_map = resp.headers or {}
@@ -1113,12 +1125,16 @@ class WildberriesClient:
 
             page_obj.on("response", on_response)
             should_retry = False
+            last_status: int | None = None
 
             try:
                 goto_response = await page_obj.goto(
                     html_url,
-                    wait_until="domcontentloaded",
+                    wait_until="networkidle",
+                    timeout=30000,
                 )
+                if goto_response is not None:
+                    last_status = goto_response.status
                 if goto_response and goto_response.status in {403, 498}:
                     logger.warning(
                         "[WB/Playwright] Ответ %s на HTML-странице, пробуем обновить контекст",
@@ -1126,7 +1142,21 @@ class WildberriesClient:
                     )
                     should_retry = True
                 else:
-                    await page_obj.wait_for_timeout(self._html_settle_ms)
+                    try:
+                        await page_obj.wait_for_selector("input#searchInput", timeout=5000)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                    await page_obj.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await page_obj.wait_for_timeout(1500)
+                    try:
+                        await page_obj.mouse.move(100, 100)
+                        await page_obj.mouse.wheel(0, 600)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    await page_obj.wait_for_timeout(2000)
+
+                    logger.info("[WB/Playwright] JSON XHR найден: %s", len(responses))
 
                     collected: list[int] = []
                     for payload in responses:
@@ -1149,8 +1179,8 @@ class WildberriesClient:
                     else:
                         try:
                             await page_obj.wait_for_selector(
-                                "a.product-card__link, a.product-card__main",
-                                timeout=3000,
+                                'a[href*="/catalog/"][href$="/detail.aspx"]',
+                                timeout=10000,
                             )
                         except Exception:  # noqa: BLE001
                             pass
@@ -1159,6 +1189,12 @@ class WildberriesClient:
                             'a[href*="/catalog/"][href$="/detail.aspx"]',
                             "els => els.map(a => a.href)",
                         )
+                        links_count = len(links) if isinstance(links, Sequence) else 0
+                        logger.info(
+                            "[WB/Playwright] JS-инициализация завершена, карточек в DOM: %s",
+                            links_count,
+                        )
+
                         dom_ids: list[int] = []
                         if isinstance(links, Sequence):
                             for link in links:
@@ -1192,13 +1228,33 @@ class WildberriesClient:
                 except Exception:  # noqa: BLE001
                     pass
 
-            if should_retry and attempt == 0:
+            if should_retry:
+                if last_status == 498:
+                    consecutive_498 += 1
+                else:
+                    consecutive_498 = 0
+
+                if last_status == 498 and consecutive_498 >= 3:
+                    if context_used is not None:
+                        try:
+                            await context_used.clear_cookies()
+                            await context_used.clear_permissions()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    await asyncio.sleep(random.uniform(1.2, 2.4))
+                    await self._close_browser_context_locked()
+                    context_used = None
+                    force_refresh = True
+                    consecutive_498 = 0
+                else:
+                    await asyncio.sleep(random.uniform(0.6, 1.2))
+
                 nm_ids = []
                 continue
 
             break
 
-        if context_used is not None:
+        if context_used is not None and context_used is self._browser_context:
             await self._persist_browser_state(context_used)
 
         nm_ids = nm_ids[:MAX_HTML_IDS]
