@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Mapping, Sequence
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 API_URL = "https://search.wb.ru/exactmatch/ru/common/v4/search"
 DETAIL_API_URL = "https://card.wb.ru/cards/detail"
@@ -12,11 +15,15 @@ DEFAULT_SEARCH_PARAMS = {
     "appType": 1,
     "curr": "rub",
     "dest": -1257786,
+    # Wildberries отдаёт результаты только для выбранного списка регионов.
     "regions": (
         "80,64,38,4,115,83,33,68,70,86,75,30,40,48,69,22,66,31,1,114"
     ),
-    "spp": 0,
+    # Значение 30 соответствует анонимному поиску на сайте и не требует авторизации.
+    "spp": 30,
 }
+
+FALLBACK_SEARCH_URL = "https://search.wb.ru/filter"
 
 
 @dataclass(slots=True)
@@ -53,7 +60,13 @@ class WildberriesClient:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0 Safari/537.36"
             ),
-            "Accept": "application/json",
+            # Wildberries блокирует запросы без набора браузерных заголовков.
+            # Дублируем основные поля из реального фронтенда, чтобы избежать 403.
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Origin": "https://www.wildberries.ru",
+            "Referer": "https://www.wildberries.ru/",
+            "X-Requested-With": "XMLHttpRequest",
         }
 
     async def search(
@@ -73,7 +86,12 @@ class WildberriesClient:
         candidates: list[dict[str, Any]] = []
         min_price_units = int(min_price * 100)
 
-        async with httpx.AsyncClient(timeout=self._timeout, headers=self._headers) as client:
+        async with httpx.AsyncClient(
+            timeout=self._timeout,
+            headers=self._headers,
+            follow_redirects=True,
+            http2=True,
+        ) as client:
             page = 1
             while len(candidates) < max_candidates and page <= max_pages:
                 params = {
@@ -85,8 +103,7 @@ class WildberriesClient:
                 }
                 params.update(DEFAULT_SEARCH_PARAMS)
 
-                response = await client.get(API_URL, params=params)
-                response.raise_for_status()
+                response = await self._perform_search_request(client, params)
                 payload = response.json()
 
                 products_data: Iterable[dict[str, Any]] = payload.get("data", {}).get("products", [])
@@ -144,7 +161,12 @@ class WildberriesClient:
             "nm": ",".join(ids),
         }
 
-        async with httpx.AsyncClient(timeout=self._timeout, headers=self._headers) as client:
+        async with httpx.AsyncClient(
+            timeout=self._timeout,
+            headers=self._headers,
+            follow_redirects=True,
+            http2=True,
+        ) as client:
             response = await client.get(DETAIL_API_URL, params=params)
             response.raise_for_status()
             payload = response.json()
@@ -292,6 +314,39 @@ class WildberriesClient:
         texts.extend(str(feature) for feature in features)
 
         return WildberriesClient._contains_words(excludes, texts)
+
+    async def _perform_search_request(
+        self,
+        client: httpx.AsyncClient,
+        params: Mapping[str, Any],
+    ) -> httpx.Response:
+        """Выполняет запрос к поиску с запасным вариантом при блокировках."""
+
+        try:
+            response = await client.get(API_URL, params=params)
+            response.raise_for_status()
+            return response
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            logger.warning(
+                "Поисковый API вернул статус %s, пробуем запасной эндпоинт", status
+            )
+            # Wildberries может отдавать 403/429 на основной эндпоинт.
+            # В этом случае повторяем запрос к filter API с теми же параметрами.
+            fallback_params = dict(params)
+            fallback_params.setdefault("query", params.get("query", ""))
+            fallback_params.setdefault("limit", params.get("limit", 100))
+            fallback_params.setdefault("page", params.get("page", 1))
+            try:
+                response = await client.get(FALLBACK_SEARCH_URL, params=fallback_params)
+                response.raise_for_status()
+                return response
+            except httpx.HTTPError:
+                logger.exception("Не удалось получить результаты даже с fallback")
+                raise exc
+        except httpx.HTTPError:
+            logger.exception("Ошибка при обращении к поисковому API Wildberries")
+            raise
 
     @staticmethod
     def _contains_words(words: Sequence[str], texts: Sequence[str]) -> bool:
