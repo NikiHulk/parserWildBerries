@@ -37,14 +37,21 @@ def _parse_price(value: str | int | None) -> int | None:
 
 async def _run(args: argparse.Namespace) -> None:
     settings = get_settings()
+    throttle = args.throttle
+    if throttle is not None and throttle <= 0:
+        throttle = None
+
     client = WildberriesClient(
         timeout=settings.request_timeout,
         min_rating=settings.min_rating,
         min_feedbacks=settings.min_feedbacks,
         min_discount=settings.min_discount,
-        page_delay_ms=args.throttle,
+        page_delay_ms=throttle,
         force_html_first=args.html_first,
     )
+
+    if args.html_first:
+        print("HTML via Playwright fallback: принудительно")
 
     banned: List[str] = args.banned or []
     products = await client.search_products(
@@ -57,14 +64,17 @@ async def _run(args: argparse.Namespace) -> None:
     )
 
     for summary in client.last_page_logs:
-        extra = ""
         html_ids = summary.get("html_ids")
         html_enriched = summary.get("html_enriched")
+        proxy = summary.get("proxy") or "-"
+        proxy_rotated = " proxy_rotated=1" if summary.get("proxy_rotated") else ""
+        extra = ""
         if html_ids is not None:
             extra = f" ids={html_ids} enriched={html_enriched}"
         print(
             "source={source} page={page} status={status} products={products} "
-            "limit={limit} dest={dest} spp={spp} cache={cache} timing={timing:.0f}ms{extra}".format(
+            "limit={limit} dest={dest} spp={spp} cache={cache} timing={timing:.0f}ms{extra} "
+            "proxy={proxy}{proxy_rotated}".format(
                 page=summary.get("page"),
                 source=summary.get("source"),
                 status=summary.get("status"),
@@ -75,6 +85,8 @@ async def _run(args: argparse.Namespace) -> None:
                 cache=summary.get("cache"),
                 timing=summary.get("timing_ms", 0.0),
                 extra=extra,
+                proxy=proxy,
+                proxy_rotated=proxy_rotated,
             )
         )
         for item in (summary.get("top_items") or [])[:3]:
@@ -118,7 +130,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--limit",
         type=int,
-        default=10,
+        default=8,
         help="количество результатов",
     )
     parser.add_argument(
@@ -130,7 +142,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--throttle",
         type=float,
-        default=None,
+        default=2000.0,
         help="задержка между страницами в миллисекундах",
     )
     parser.add_argument(

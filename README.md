@@ -33,6 +33,14 @@ TELEGRAM_TOKEN=ВАШ_ТОКЕН
 DATABASE_URL=sqlite:///data/bot.db
 REQUEST_TIMEOUT=10
 MAX_RESULTS=10
+WB_DEFAULT_LIMIT=8
+PLAYWRIGHT_THROTTLE_MS=2000
+PLAYWRIGHT_HEADLESS=true
+PLAYWRIGHT_TZ=Europe/Moscow
+PLAYWRIGHT_STATE_PATH=/app/data/wb_playwright_state.json
+PLAYWRIGHT_USER_DATA_DIR=data
+PROXY_POOL=
+PROXY_STICKY_PAGES=10
 # Параметры YooKassa и подписок можно оставить пустыми, если они не нужны.
 YOOKASSA_SHOP_ID=
 YOOKASSA_SECRET_KEY=
@@ -51,6 +59,20 @@ python -m bot.main
 2. Для поиска товаров нажмите кнопку «🔍 Поиск товара»: бот спросит название, минимальную и (при необходимости) максимальную цену, а затем пришлёт карточки подходящих позиций.
 3. Управляйте фильтром запрещённых слов через меню «🚫 Запрещённые слова»: добавляйте и удаляйте фразы кнопками «➕ Добавить слова» и «➖ Удалить слово».
 4. При необходимости вернитесь к платёжной модели, включив команды подписки в `bot/main.py` (см. комментарии в коде).
+
+### HTML-фолбэк через Playwright
+
+Чтобы обходить антибот-проверки Wildberries и получать HTML-выдачу даже при 403/498, бот использует Playwright (headless Chromium). Рекомендуемые переменные окружения:
+
+- `PLAYWRIGHT_THROTTLE_MS` — базовая задержка между действиями браузера (по умолчанию 2000 мс).
+- `PLAYWRIGHT_HEADLESS` — включение/отключение headless-режима (`true`/`false`).
+- `PLAYWRIGHT_TZ` — временная зона браузера (по умолчанию `Europe/Moscow`).
+- `PLAYWRIGHT_STATE_PATH` — путь к файлу `storage_state` (персистентные cookies, по умолчанию `/app/data/wb_playwright_state.json`).
+- `PLAYWRIGHT_USER_DATA_DIR` — директория для хранения cookies (`data` по умолчанию).
+- `PROXY_POOL` — список прокси через запятую (`http://user:pass@ip:port`). Рекомендуются residential/ISP RU-прокси, липкие 10–30 минут.
+- `PROXY_STICKY_PAGES` — сколько страниц использовать один прокси перед ротацией.
+
+CLI `tools/check_wb.py` поддерживает опцию `--html-first`, чтобы сразу запускать Playwright-фолбэк (например, `python tools/check_wb.py --query "стакан" --max 40 --limit 8 --html-first --throttle 2000`).
 
 ## Подключение YooKassa
 

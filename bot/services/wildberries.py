@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import itertools
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -11,7 +13,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote, quote_plus, urlparse
 
 import httpx
 
@@ -35,9 +37,14 @@ HEADERS = {
 }
 
 COOKIE_TTL_SECONDS = 6 * 60 * 60
-COOKIE_FILE = Path("data/wb_cookies.json")
-PLAYWRIGHT_STORAGE_FILE = Path("/app/data/wb_playwright_state.json")
-HTML_SETTLE_MS = 800
+PLAYWRIGHT_USER_DATA_DIR = Path(
+    os.getenv("PLAYWRIGHT_USER_DATA_DIR", "data")
+).expanduser()
+COOKIE_FILE = PLAYWRIGHT_USER_DATA_DIR / "wb_cookies.json"
+PLAYWRIGHT_STORAGE_FILE = Path(
+    os.getenv("PLAYWRIGHT_STATE_PATH", "/app/data/wb_playwright_state.json")
+)
+HTML_SETTLE_MS = int(os.getenv("PLAYWRIGHT_THROTTLE_MS", "800") or "800")
 
 START_LIMIT = 20
 MAX_CATALOG_ATTEMPTS = 2
@@ -60,6 +67,29 @@ USER_AGENTS = [
 WB_REGIONS = "80,64,38,4,115,83,33,68,70,86,75,30,40,48,69,22,66,31,1,114"
 DESTS = [-1257786, -1069100, -1044448]
 SPPS = [30, 0]
+
+
+def _parse_pw_proxy(raw: str) -> dict[str, str]:
+    """Преобразует строку прокси в формат Playwright."""
+
+    parsed = urlparse(raw)
+    proxy: dict[str, str] = {
+        "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+    }
+    if parsed.username and parsed.password:
+        proxy["username"] = parsed.username
+        proxy["password"] = parsed.password
+    return proxy
+
+
+def _mask_proxy(raw: str | None) -> str | None:
+    if not raw:
+        return raw
+    parsed = urlparse(raw)
+    host = parsed.hostname or raw
+    port = f":{parsed.port}" if parsed.port else ""
+    scheme = f"{parsed.scheme}://" if parsed.scheme else ""
+    return f"{scheme}{host}{port}"
 
 def url_catalog(query: str, page: int, limit: int, dest: int, spp: int) -> str:
     return (
@@ -204,7 +234,10 @@ class WildberriesClient:
         self._cookie_lock = asyncio.Lock()
         self._storage_state_file = PLAYWRIGHT_STORAGE_FILE
         self._html_settle_ms = HTML_SETTLE_MS
-        self._playwright_headless = True
+        headless_env = os.getenv("PLAYWRIGHT_HEADLESS")
+        self._playwright_headless = not (
+            headless_env and headless_env.strip().lower() in {"0", "false", "no"}
+        )
         self._playwright_args = ["--no-sandbox", "--disable-dev-shm-usage"]
         self._playwright_manager = None
         self._browser = None
@@ -212,6 +245,17 @@ class WildberriesClient:
         self._browser_lock = asyncio.Lock()
         self._html_context_user_agent: str | None = None
         self._last_html_ok = False
+        proxy_pool_raw = os.getenv("PROXY_POOL", "")
+        self._proxy_pool = [item.strip() for item in proxy_pool_raw.split(",") if item.strip()]
+        self._proxy_cycle = itertools.cycle(self._proxy_pool) if self._proxy_pool else None
+        self._proxy_current: str | None = None
+        self._proxy_uses = 0
+        self._proxy_sticky_pages = max(
+            1,
+            int(os.getenv("PROXY_STICKY_PAGES", "10") or "10"),
+        )
+        self._proxy_force_rotate = False
+        self._proxy_rotated_flag = 0
 
     @staticmethod
     def _detect_http2_support() -> bool:
@@ -601,10 +645,7 @@ class WildberriesClient:
                 self._playwright_manager = await async_playwright().start()
 
             if self._browser is None:
-                self._browser = await self._playwright_manager.chromium.launch(
-                    headless=self._playwright_headless,
-                    args=self._playwright_args,
-                )
+                await self._launch_browser_locked()
 
             storage_state_arg: str | None = None
             cookie_source: str | None = None
@@ -630,12 +671,13 @@ class WildberriesClient:
                     cookie_source = f"file {len(cookies)}"
 
             user_agent = self._pick_user_agent()
+            timezone_id = os.getenv("PLAYWRIGHT_TZ", "Europe/Moscow")
             context_kwargs = {
                 "user_agent": user_agent,
                 "locale": "ru-RU",
                 "java_script_enabled": True,
                 "viewport": {"width": 1366, "height": 768},
-                "timezone_id": "Europe/Moscow",
+                "timezone_id": timezone_id,
                 "permissions": ["geolocation"],
                 "extra_http_headers": {
                     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
@@ -656,10 +698,14 @@ class WildberriesClient:
             try:
                 await self._browser_context.add_init_script(
                     """
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
+                    Object.defineProperty(navigator,'platform',{get:()=> 'Win32'});
+                    Object.defineProperty(navigator,'hardwareConcurrency',{get:()=>8});
+                    Object.defineProperty(navigator,'deviceMemory',{get:()=>8});
+                    Object.defineProperty(navigator,'language',{get:()=> 'ru-RU'});
+                    Object.defineProperty(navigator,'languages',{get:()=>['ru-RU','ru','en-US','en']});
                     window.chrome = { runtime: {} };
-                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
-                    Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU', 'ru'] });
+                    Object.defineProperty(navigator,'plugins',{ get: () => [1, 2, 3] });
                     """
                 )
             except Exception as exc:  # noqa: BLE001
@@ -672,6 +718,34 @@ class WildberriesClient:
                 await self._initialize_browser_context(self._browser_context)
 
             return self._browser_context
+
+    async def _launch_browser_locked(self) -> None:
+        if self._playwright_manager is None:
+            return
+
+        launch_kwargs = {
+            "headless": self._playwright_headless,
+            "args": self._playwright_args,
+        }
+        if self._proxy_cycle is not None:
+            if (
+                self._proxy_force_rotate
+                or self._proxy_current is None
+                or self._proxy_uses >= self._proxy_sticky_pages
+            ):
+                self._proxy_current = next(self._proxy_cycle)
+                self._proxy_uses = 0
+                self._proxy_force_rotate = False
+                self._proxy_rotated_flag = 1
+                logger.info("[WB/Playwright] Переключение на прокси %s", self._proxy_current)
+            if self._proxy_current:
+                try:
+                    launch_kwargs["proxy"] = _parse_pw_proxy(self._proxy_current)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[WB/Playwright] Некорректный прокси %s: %s", self._proxy_current, exc)
+                    self._proxy_current = None
+                    self._proxy_force_rotate = False
+        self._browser = await self._playwright_manager.chromium.launch(**launch_kwargs)
 
     async def _initialize_browser_context(self, context: "BrowserContext") -> None:
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -734,6 +808,8 @@ class WildberriesClient:
             self._browser = None
 
         self._html_context_user_agent = None
+        if self._proxy_cycle is not None:
+            self._proxy_force_rotate = True
 
     async def _load_cookies_from_disk(self) -> tuple[list[dict[str, Any]] | None, float | None]:
         def _load() -> tuple[list[dict[str, Any]] | None, float | None]:
@@ -831,8 +907,13 @@ class WildberriesClient:
             "top_items": list(top_items or []),
             "html_ids": page_meta.html_ids,
             "html_enriched": page_meta.html_enriched,
+            "proxy": _mask_proxy(self._proxy_current),
+            "proxy_rotated": self._proxy_rotated_flag,
         }
         self._last_page_logs.append(summary)
+        proxy_used = _mask_proxy(self._proxy_current)
+        proxy_rotated = self._proxy_rotated_flag
+        self._proxy_rotated_flag = 0
 
         extra_parts: list[str] = []
         if page_meta.source in {"html_xhr", "html_dom"}:
@@ -840,6 +921,10 @@ class WildberriesClient:
                 extra_parts.append(f"ids={page_meta.html_ids}")
             if page_meta.html_enriched is not None:
                 extra_parts.append(f"enriched={page_meta.html_enriched}")
+        if proxy_used:
+            extra_parts.append(f"proxy={proxy_used}")
+        if proxy_rotated:
+            extra_parts.append("proxy_rotated=1")
         extra_suffix = f" {' '.join(extra_parts)}" if extra_parts else ""
 
         timing_int = int(page_meta.timing_ms) if page_meta.timing_ms else 0
@@ -1090,47 +1175,69 @@ class WildberriesClient:
         html_url = url_html_search(query, page)
         nm_ids: list[int] = []
         source = "html_xhr"
-        context_used: BrowserContext | None = None
-        consecutive_498 = 0
-        force_refresh = False
         attempt = 0
         max_attempts = 6
+        consecutive_blocks = 0
         slow_mode_next = False
-        pre_attempt_delay = 0.0
 
-        while attempt < max_attempts:
+        def delay_ms(range_: tuple[float, float]) -> int:
+            return max(250, int(random.uniform(*range_) * 1000))
+
+        async def dismiss_banners(page_obj) -> None:
+            selectors = [
+                "button[aria-label='Закрыть']",
+                "button[aria-label='Close']",
+                "button[data-wba-header-name='Close']",
+                "button.j-close",
+            ]
+            for selector in selectors:
+                try:
+                    button = await page_obj.query_selector(selector)
+                    if button:
+                        await button.click()
+                        await page_obj.wait_for_timeout(250)
+                except Exception:  # noqa: BLE001
+                    continue
+
+        while attempt < max_attempts and not nm_ids:
             attempt += 1
-            if pre_attempt_delay > 0:
-                await asyncio.sleep(pre_attempt_delay)
-                pre_attempt_delay = 0.0
+            delay_range = (1.5, 2.5) if slow_mode_next else (0.3, 0.8)
+            slow_mode_next = False
+            if (
+                self._proxy_cycle is not None
+                and self._proxy_current is not None
+                and self._proxy_uses >= self._proxy_sticky_pages
+            ):
+                await self._close_browser_context_locked()
             try:
-                context = await self._ensure_browser_context(force_refresh=force_refresh)
+                context = await self._ensure_browser_context(force_refresh=False)
             except Exception as exc:  # noqa: BLE001
                 logger.error("[WB/Playwright] Не удалось подготовить контекст: %s", exc)
-                force_refresh = True
                 await asyncio.sleep(random.uniform(1.2, 2.4))
                 continue
 
-            force_refresh = False
-            context_used = context
-            slow_mode = slow_mode_next
-            slow_mode_next = False
             page_obj = await context.new_page()
-            page_obj.set_default_navigation_timeout(45000 if slow_mode else 30000)
+            page_obj.set_default_navigation_timeout(30000)
             page_obj.set_default_timeout(15000)
+            await page_obj.set_extra_http_headers(
+                {
+                    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+                    "Sec-CH-UA": '"Chromium";v="140", "Not;A=Brand";v="24"',
+                    "Sec-CH-UA-Platform": '"Windows"',
+                    "Sec-CH-UA-Mobile": "?0",
+                }
+            )
 
             responses: list[dict[str, Any]] = []
-            links_list: list[str] = []
-            self._last_html_ok = False
             last_status: int | None = None
-            should_retry = False
+            html_block_detected = False
 
             async def capture_response(resp) -> None:  # type: ignore[no-untyped-def]
                 try:
                     url_value = resp.url
                     if url_value.startswith("https://www.wildberries.ru/catalog/") and resp.status == 200:
                         self._last_html_ok = True
-                    if not (
+                    if (
                         ("search" in url_value or "catalog" in url_value)
                         and (
                             "wbxcatalog-ru" in url_value
@@ -1138,145 +1245,156 @@ class WildberriesClient:
                             or "search.wb.ru" in url_value
                         )
                     ):
-                        return
-                    content_type = (resp.headers or {}).get("content-type", "")
-                    if resp.status == 200 and "application/json" in content_type:
-                        data = await resp.json()
-                        if (
-                            isinstance(data, Mapping)
-                            and isinstance(data.get("data"), Mapping)
-                            and isinstance(data["data"].get("products"), Sequence)
-                            and data["data"]["products"]
-                        ):
-                            responses.append(data)
+                        content_type = (resp.headers or {}).get("content-type", "")
+                        if resp.status == 200 and "application/json" in content_type:
+                            data = await resp.json()
+                            if (
+                                isinstance(data, Mapping)
+                                and isinstance(data.get("data"), Mapping)
+                                and isinstance(data["data"].get("products"), Sequence)
+                                and data["data"]["products"]
+                            ):
+                                responses.append(data)
                 except Exception:  # noqa: BLE001
-                    pass
+                    return
 
             page_obj.on("response", capture_response)
 
             try:
-                goto_response = None
-                if slow_mode:
-                    for _ in range(3):
-                        try:
-                            goto_response = await page_obj.goto(
-                                html_url,
-                                wait_until="load",
-                                timeout=45000,
-                            )
-                            if goto_response is not None:
-                                last_status = goto_response.status
-                            if goto_response and goto_response.status == 200:
-                                break
-                            await page_obj.wait_for_timeout(random.uniform(5000, 7000))
-                        except PlaywrightTimeoutError:
-                            await page_obj.wait_for_timeout(random.uniform(3000, 5000))
-                        except Exception:
-                            await page_obj.wait_for_timeout(random.uniform(3000, 5000))
-                else:
+                goto_main = await page_obj.goto(
+                    "https://www.wildberries.ru/",
+                    wait_until="load",
+                    timeout=30000,
+                )
+                if goto_main is not None:
+                    last_status = goto_main.status
+                await page_obj.wait_for_timeout(delay_ms(delay_range))
+                await dismiss_banners(page_obj)
+
+                try:
+                    search_input = await page_obj.wait_for_selector("input#searchInput", timeout=5000)
+                except PlaywrightTimeoutError:
+                    search_input = None
+
+                if search_input:
+                    await page_obj.wait_for_timeout(delay_ms(delay_range))
+                    try:
+                        await search_input.click()
+                        await page_obj.wait_for_timeout(delay_ms(delay_range))
+                        await search_input.fill(query)
+                        await page_obj.wait_for_timeout(delay_ms(delay_range))
+                        await search_input.press("Enter")
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                await page_obj.wait_for_timeout(delay_ms(delay_range))
+                try:
+                    await page_obj.wait_for_load_state("domcontentloaded")
+                except PlaywrightTimeoutError:
+                    pass
+
+                if page > 1:
                     goto_response = await page_obj.goto(
                         html_url,
-                        wait_until="networkidle",
+                        wait_until="domcontentloaded",
                         timeout=30000,
                     )
                     if goto_response is not None:
                         last_status = goto_response.status
-
-                if goto_response and goto_response.status in {403, 498}:
-                    logger.warning(
-                        "[WB/Playwright] Ответ %s на HTML-странице, пробуем обновить контекст",
-                        goto_response.status,
-                    )
-                    should_retry = True
                 else:
-                    await page_obj.wait_for_timeout(random.uniform(4000, 6000))
-                    try:
-                        await page_obj.wait_for_selector("input#searchInput", timeout=5000)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    try:
-                        await page_obj.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    except Exception:  # noqa: BLE001
-                        pass
-                    await page_obj.wait_for_timeout(1500)
-                    try:
-                        await page_obj.mouse.move(150, 150)
-                        await page_obj.mouse.wheel(0, 800)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    await page_obj.wait_for_timeout(random.uniform(2000, 3500))
+                    last_status = last_status or (goto_main.status if goto_main else None)
 
-                    if self._last_html_ok:
-                        logger.info("[WB/Playwright] Challenge пройден, загрузка каталога OK")
+                grid_selectors = [
+                    "div.catalog-page",
+                    "div.product-card-list",
+                    ".product-card",
+                    ".product-card__wrapper",
+                    "[data-nm-id]",
+                ]
+                for selector in grid_selectors:
+                    try:
+                        await page_obj.wait_for_selector(selector, timeout=5000)
+                        break
+                    except PlaywrightTimeoutError:
+                        continue
 
+                for _ in range(3):
+                    await page_obj.wait_for_timeout(delay_ms(delay_range))
+                    try:
+                        await page_obj.mouse.move(random.randint(80, 320), random.randint(120, 360))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        await page_obj.mouse.wheel(0, random.randint(300, 900))
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                await page_obj.wait_for_timeout(delay_ms(delay_range))
+
+                if responses:
                     logger.info("[WB/Playwright] JSON XHR найден: %s", len(responses))
-
                     collected: list[int] = []
                     for payload in responses:
-                        data = payload.get("data") if isinstance(payload, Mapping) else None
-                        products = data.get("products") if isinstance(data, Mapping) else None
-                        if not isinstance(products, Sequence):
-                            continue
-                        for raw in products:
-                            if not isinstance(raw, Mapping):
-                                continue
-                            try:
-                                nm_id = int(raw.get("id"))
-                            except (TypeError, ValueError):
-                                continue
-                            collected.append(nm_id)
-
-                    nm_ids = list(dict.fromkeys(collected))
-                    dom_ids: list[int] = []
-                    if nm_ids:
+                        data = payload.get("data") if isinstance(payload, Mapping) else {}
+                        products = (
+                            data.get("products") if isinstance(data, Mapping) else []
+                        )
+                        if isinstance(products, Sequence):
+                            for raw in products:
+                                if isinstance(raw, Mapping) and raw.get("id") is not None:
+                                    try:
+                                        collected.append(int(raw["id"]))
+                                    except (TypeError, ValueError):
+                                        continue
+                    if collected:
+                        nm_ids = list(dict.fromkeys(collected))
                         source = "html_xhr"
-                    else:
-                        try:
-                            await page_obj.wait_for_selector(
-                                'a[href*="/catalog/"][href$="/detail.aspx"]',
-                                timeout=10000,
-                            )
-                        except Exception:  # noqa: BLE001
-                            pass
 
-                        try:
-                            raw_links = await page_obj.eval_on_selector_all(
-                                'a[href*="/catalog/"][href$="/detail.aspx"]',
-                                'els => els.map(a => a.href)',
-                            )
-                        except Exception:
-                            raw_links = []
+                if not nm_ids:
+                    dom_ids: list[int] = []
+                    try:
+                        raw_dom = await page_obj.eval_on_selector_all(
+                            "[data-nm-id]",
+                            "els => els.map(el => el.getAttribute('data-nm-id'))",
+                        )
+                    except Exception:  # noqa: BLE001
+                        raw_dom = []
 
-                        links_list = [
-                            link for link in raw_links if isinstance(link, str)
-                        ]
+                    for value in raw_dom or []:
+                        if value and str(value).isdigit():
+                            dom_ids.append(int(value))
 
-                        for link in links_list:
-                            match = re.search(r"/catalog/(\d+)/detail\.aspx", link)
-                            if not match:
-                                continue
-                            try:
-                                dom_ids.append(int(match.group(1)))
-                            except (TypeError, ValueError):
-                                continue
-                        if dom_ids:
-                            dom_ids = list(dict.fromkeys(dom_ids))
-                            nm_ids = dom_ids
-                            source = "html_dom"
-                        else:
-                            nm_ids = []
+                    try:
+                        links = await page_obj.eval_on_selector_all(
+                            'a[href*="/catalog/"][href*="/detail"]',
+                            'els => els.map(a => a.href)',
+                        )
+                    except Exception:  # noqa: BLE001
+                        links = []
 
                     logger.info(
-                        "[WB/Playwright] DOM карточек: %s, XHR карточек: %s",
-                        len(links_list),
-                        len(responses),
+                        "[WB/Playwright] JS-инициализация завершена, карточек в DOM: %s",
+                        len(links or []),
                     )
+
+                    for href in links or []:
+                        match = re.search(r"/catalog/(\d+)/detail\.aspx", href)
+                        if match:
+                            dom_ids.append(int(match.group(1)))
+
+                    if dom_ids:
+                        nm_ids = list(dict.fromkeys(dom_ids))
+                        source = "html_dom"
+
+                if not nm_ids:
+                    html_block_detected = True
+
             except PlaywrightTimeoutError as exc:
-                logger.warning("[WB/Playwright] Таймаут на HTML-странице: %s", exc)
-                should_retry = True
+                logger.warning("[WB/Playwright] Таймаут HTML-поиска: %s", exc)
+                html_block_detected = True
             except Exception as exc:  # noqa: BLE001
-                logger.warning("[WB/Playwright] Ошибка при загрузке HTML-страницы: %s", exc)
-                should_retry = True
+                logger.warning("[WB/Playwright] Ошибка Playwright: %s", exc)
+                html_block_detected = True
             finally:
                 try:
                     page_obj.off("response", capture_response)
@@ -1287,36 +1405,34 @@ class WildberriesClient:
                 except Exception:  # noqa: BLE001
                     pass
 
-            if should_retry:
-                if last_status == 498:
-                    consecutive_498 += 1
-                else:
-                    consecutive_498 = 0
-
-                if last_status == 498 and consecutive_498 >= 3:
-                    if context_used is not None:
-                        try:
-                            await context_used.clear_cookies()
-                            await context_used.clear_permissions()
-                        except Exception:  # noqa: BLE001
-                            pass
-                    await asyncio.sleep(random.uniform(2.0, 4.0))
+            if html_block_detected or (last_status in {403, 498}):
+                consecutive_blocks += 1
+                slow_mode_next = True
+                if self._proxy_cycle is not None:
+                    self._proxy_uses = self._proxy_sticky_pages
+                if self._proxy_cycle is not None and (last_status in {403, 498}):
+                    self._proxy_force_rotate = True
+                if consecutive_blocks >= 3:
+                    if self._proxy_cycle is not None:
+                        self._proxy_force_rotate = True
                     await self._close_browser_context_locked()
-                    context_used = None
-                    force_refresh = True
-                    slow_mode_next = True
-                    pre_attempt_delay = random.uniform(2.0, 4.0)
-                    consecutive_498 = 0
+                    await asyncio.sleep(random.uniform(1.2, 2.4))
+                    consecutive_blocks = 0
                 else:
-                    await asyncio.sleep(random.uniform(0.6, 1.2))
-
+                    await asyncio.sleep(random.uniform(0.8, 1.4))
                 nm_ids = []
                 continue
 
+            if self._proxy_cycle is not None:
+                self._proxy_uses += 1
+
+            if nm_ids:
+                logger.info("[WB/Playwright] Challenge пройден, загрузка каталога OK")
+
             break
 
-        if context_used is not None and context_used is self._browser_context:
-            await self._persist_browser_state(context_used)
+        if self._browser_context is not None:
+            await self._persist_browser_state(self._browser_context)
 
         nm_ids = nm_ids[:MAX_HTML_IDS]
 
