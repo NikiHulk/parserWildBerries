@@ -33,14 +33,20 @@ TELEGRAM_TOKEN=ВАШ_ТОКЕН
 DATABASE_URL=sqlite:///data/bot.db
 REQUEST_TIMEOUT=10
 MAX_RESULTS=10
+WB_DEFAULT_MIN_PRICE=
+WB_DEFAULT_MAX_PRICE=
 WB_DEFAULT_LIMIT=8
 PLAYWRIGHT_THROTTLE_MS=2000
 PLAYWRIGHT_HEADLESS=true
 PLAYWRIGHT_TZ=Europe/Moscow
 PLAYWRIGHT_STATE_PATH=/app/data/wb_playwright_state.json
 PLAYWRIGHT_USER_DATA_DIR=data
+PLAYWRIGHT_PROXY=
 PROXY_POOL=
 PROXY_STICKY_PAGES=10
+HTTPX_PROXY=
+WB_HTTP_PROXY=
+HTTP_PROXY=
 # Параметры YooKassa и подписок можно оставить пустыми, если они не нужны.
 YOOKASSA_SHOP_ID=
 YOOKASSA_SECRET_KEY=
@@ -60,19 +66,69 @@ python -m bot.main
 3. Управляйте фильтром запрещённых слов через меню «🚫 Запрещённые слова»: добавляйте и удаляйте фразы кнопками «➕ Добавить слова» и «➖ Удалить слово».
 4. При необходимости вернитесь к платёжной модели, включив команды подписки в `bot/main.py` (см. комментарии в коде).
 
-### HTML-фолбэк через Playwright
+### HTML-фолбэк через Playwright и прокси
 
-Чтобы обходить антибот-проверки Wildberries и получать HTML-выдачу даже при 403/498, бот использует Playwright (headless Chromium). Рекомендуемые переменные окружения:
+Чтобы обходить антибот-проверки Wildberries и получать HTML-выдачу даже при 403/498, бот использует Playwright (headless Chromium) и пул прокси. Основные переменные окружения:
 
-- `PLAYWRIGHT_THROTTLE_MS` — базовая задержка между действиями браузера (по умолчанию 2000 мс).
-- `PLAYWRIGHT_HEADLESS` — включение/отключение headless-режима (`true`/`false`).
+- `WB_DEFAULT_MIN_PRICE` / `WB_DEFAULT_MAX_PRICE` / `WB_DEFAULT_LIMIT` — дефолтные параметры поиска для CLI/бота (если пользователь не указал иное).
+- `PLAYWRIGHT_THROTTLE_MS` — базовая задержка между действиями браузера (по умолчанию 2000 мс). При агрессивных блокировках увеличьте значение.
+- `PLAYWRIGHT_HEADLESS` — режим браузера (`true`/`false`).
 - `PLAYWRIGHT_TZ` — временная зона браузера (по умолчанию `Europe/Moscow`).
-- `PLAYWRIGHT_STATE_PATH` — путь к файлу `storage_state` (персистентные cookies, по умолчанию `/app/data/wb_playwright_state.json`).
-- `PLAYWRIGHT_USER_DATA_DIR` — директория для хранения cookies (`data` по умолчанию).
+- `PLAYWRIGHT_STATE_PATH` — файл `storage_state`, где сохраняются cookies/локальные данные (по умолчанию `/app/data/wb_playwright_state.json`).
+- `PLAYWRIGHT_USER_DATA_DIR` — директория для вспомогательных данных Playwright (`data` по умолчанию).
+- `PLAYWRIGHT_PROXY` — фиксированный прокси только для Playwright. Если не указан, клиент будет чередовать значения из `PROXY_POOL`.
 - `PROXY_POOL` — список прокси через запятую (`http://user:pass@ip:port`). Рекомендуются residential/ISP RU-прокси, липкие 10–30 минут.
-- `PROXY_STICKY_PAGES` — сколько страниц использовать один прокси перед ротацией.
+- `PROXY_STICKY_PAGES` — сколько страниц отдавать одному прокси перед ротацией (по умолчанию 10).
+- `HTTPX_PROXY` / `WB_HTTP_PROXY` / `HTTP_PROXY` — прокси для HTTP-запросов (JSON API Wildberries, Telegram и т.д.). Клиент использует первое непустое значение в указанном порядке.
 
-CLI `tools/check_wb.py` поддерживает опцию `--html-first`, чтобы сразу запускать Playwright-фолбэк (например, `python tools/check_wb.py --query "стакан" --max 40 --limit 8 --html-first --throttle 2000`).
+CLI `tools/check_wb.py` поддерживает опцию `--html-first`, чтобы сразу запускать Playwright-фолбэк (например, `python tools/check_wb.py --query "стакан" --max 40 --limit 8 --html-first --throttle 2000`). При включённом режиме выводит источник (`html_xhr`/`html_dom`), использованный прокси и факт ротации.
+
+#### Быстрая проверка прокси/IP
+
+Проверить, какой IP-адрес видит Wildberries через httpx:
+
+```bash
+python - <<'PY'
+import os
+import httpx
+
+proxy = os.getenv('HTTPX_PROXY') or os.getenv('WB_HTTP_PROXY') or os.getenv('HTTP_PROXY')
+transport = httpx.AsyncHTTPTransport(proxy=proxy) if proxy else None
+
+async def main():
+    async with httpx.AsyncClient(transport=transport) as client:
+        resp = await client.get('https://ifconfig.me/ip', timeout=5.0)
+        print('HTTPX IP:', resp.text.strip())
+
+import asyncio
+asyncio.run(main())
+PY
+```
+
+И проверить IP Playwright (используется тот же прокси и cookies, что и у бота):
+
+```bash
+python - <<'PY'
+import asyncio
+import os
+from playwright.async_api import async_playwright
+
+async def main():
+    proxy = os.getenv('PLAYWRIGHT_PROXY')
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=os.getenv('PLAYWRIGHT_HEADLESS', 'true').lower() not in {'0','false','no'},
+            proxy={'server': proxy} if proxy else None,
+        )
+        page = await browser.new_page()
+        await page.goto('https://ifconfig.me/', wait_until='domcontentloaded', timeout=15000)
+        ip = await page.text_content('body')
+        print('Playwright IP:', (ip or '').strip())
+        await browser.close()
+
+asyncio.run(main())
+PY
+```
 
 ## Подключение YooKassa
 

@@ -51,7 +51,10 @@ async def _run(args: argparse.Namespace) -> None:
     )
 
     if args.html_first:
-        print("HTML via Playwright fallback: принудительно")
+        print(
+            "HTML via Playwright fallback: принудительный режим (медленнее, "
+            "используются прокси/ротация)"
+        )
 
     banned: List[str] = args.banned or []
     products = await client.search_products(
@@ -68,13 +71,14 @@ async def _run(args: argparse.Namespace) -> None:
         html_enriched = summary.get("html_enriched")
         proxy = summary.get("proxy") or "-"
         proxy_rotated = " proxy_rotated=1" if summary.get("proxy_rotated") else ""
+        slow = bool(summary.get("slow"))
         extra = ""
         if html_ids is not None:
             extra = f" ids={html_ids} enriched={html_enriched}"
         print(
             "source={source} page={page} status={status} products={products} "
-            "limit={limit} dest={dest} spp={spp} cache={cache} timing={timing:.0f}ms{extra} "
-            "proxy={proxy}{proxy_rotated}".format(
+            "limit={limit} dest={dest} spp={spp} cache={cache} slow={slow} "
+            "timing={timing:.0f}ms{extra} proxy={proxy}{proxy_rotated}".format(
                 page=summary.get("page"),
                 source=summary.get("source"),
                 status=summary.get("status"),
@@ -83,6 +87,7 @@ async def _run(args: argparse.Namespace) -> None:
                 dest=summary.get("dest"),
                 spp=summary.get("spp"),
                 cache=summary.get("cache"),
+                slow=slow,
                 timing=summary.get("timing_ms", 0.0),
                 extra=extra,
                 proxy=proxy,

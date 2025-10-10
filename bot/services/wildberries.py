@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
-import itertools
 import json
 import logging
 import os
@@ -13,7 +12,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List
-from urllib.parse import quote, quote_plus, urlparse
+from urllib.parse import quote, quote_plus
 
 import httpx
 
@@ -52,6 +51,14 @@ PAGE_DELAY_RANGE = (0.30, 0.70)
 DETAIL_BATCH = 100
 MAX_HTML_IDS = 120
 
+from bot.utils.proxy import (
+    choose_proxy_from_pool,
+    make_httpx_transport,
+    parse_proxy_url,
+    sanitize_proxy,
+)
+
+
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
@@ -67,30 +74,6 @@ USER_AGENTS = [
 WB_REGIONS = "80,64,38,4,115,83,33,68,70,86,75,30,40,48,69,22,66,31,1,114"
 DESTS = [-1257786, -1069100, -1044448]
 SPPS = [30, 0]
-
-
-def _parse_pw_proxy(raw: str) -> dict[str, str]:
-    """Преобразует строку прокси в формат Playwright."""
-
-    parsed = urlparse(raw)
-    proxy: dict[str, str] = {
-        "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
-    }
-    if parsed.username and parsed.password:
-        proxy["username"] = parsed.username
-        proxy["password"] = parsed.password
-    return proxy
-
-
-def _mask_proxy(raw: str | None) -> str | None:
-    if not raw:
-        return raw
-    parsed = urlparse(raw)
-    host = parsed.hostname or raw
-    port = f":{parsed.port}" if parsed.port else ""
-    scheme = f"{parsed.scheme}://" if parsed.scheme else ""
-    return f"{scheme}{host}{port}"
-
 def url_catalog(query: str, page: int, limit: int, dest: int, spp: int) -> str:
     return (
         "https://catalog.wb.ru/catalog/0/search"
@@ -191,6 +174,7 @@ class PageFetchMeta:
     timing_ms: float
     html_ids: int | None = None
     html_enriched: int | None = None
+    slow_mode: bool = False
 
 
 class WildberriesClient:
@@ -212,6 +196,13 @@ class WildberriesClient:
         if user_agent:
             self._headers["User-Agent"] = user_agent
         self._user_agent_locked = bool(user_agent)
+        self._httpx_proxy_raw = (
+            os.getenv("HTTPX_PROXY")
+            or os.getenv("WB_HTTP_PROXY")
+            or os.getenv("HTTP_PROXY")
+        )
+        if sanitized := sanitize_proxy(self._httpx_proxy_raw):
+            logger.info("[WB/httpx] Используется прокси %s", sanitized)
         self._http2_enabled = self._detect_http2_support()
         self._min_rating = min_rating
         self._min_feedbacks = min_feedbacks
@@ -246,9 +237,10 @@ class WildberriesClient:
         self._html_context_user_agent: str | None = None
         self._last_html_ok = False
         proxy_pool_raw = os.getenv("PROXY_POOL", "")
-        self._proxy_pool = [item.strip() for item in proxy_pool_raw.split(",") if item.strip()]
-        self._proxy_cycle = itertools.cycle(self._proxy_pool) if self._proxy_pool else None
-        self._proxy_current: str | None = None
+        self._playwright_proxy_static = os.getenv("PLAYWRIGHT_PROXY") or None
+        self._proxy_pool_env_key = "PROXY_POOL"
+        self._proxy_pool_defined = bool(proxy_pool_raw.strip())
+        self._proxy_current: str | None = self._playwright_proxy_static
         self._proxy_uses = 0
         self._proxy_sticky_pages = max(
             1,
@@ -321,11 +313,14 @@ class WildberriesClient:
             session_headers["User-Agent"] = random.choice(USER_AGENTS)
         session_headers.setdefault("Accept-Encoding", HEADERS["Accept-Encoding"])
 
+        transport = make_httpx_transport(self._httpx_proxy_raw)
+
         async with httpx.AsyncClient(
             timeout=effective_timeout,
             headers=session_headers,
             follow_redirects=True,
             http2=self._http2_enabled,
+            transport=transport,
         ) as client:
             page = 1
 
@@ -727,24 +722,47 @@ class WildberriesClient:
             "headless": self._playwright_headless,
             "args": self._playwright_args,
         }
-        if self._proxy_cycle is not None:
+
+        proxy_raw: str | None = None
+        rotated = 0
+
+        if self._playwright_proxy_static:
+            proxy_raw = self._playwright_proxy_static
+            self._proxy_current = self._playwright_proxy_static
+        else:
             if (
                 self._proxy_force_rotate
                 or self._proxy_current is None
                 or self._proxy_uses >= self._proxy_sticky_pages
             ):
-                self._proxy_current = next(self._proxy_cycle)
+                proxy_raw = choose_proxy_from_pool(self._proxy_pool_env_key)
+                self._proxy_current = proxy_raw
                 self._proxy_uses = 0
                 self._proxy_force_rotate = False
-                self._proxy_rotated_flag = 1
-                logger.info("[WB/Playwright] Переключение на прокси %s", self._proxy_current)
-            if self._proxy_current:
-                try:
-                    launch_kwargs["proxy"] = _parse_pw_proxy(self._proxy_current)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("[WB/Playwright] Некорректный прокси %s: %s", self._proxy_current, exc)
+                rotated = 1 if proxy_raw else 0
+            else:
+                proxy_raw = self._proxy_current
+
+        if proxy_raw:
+            try:
+                launch_kwargs["proxy"] = parse_proxy_url(proxy_raw)
+                logger.info(
+                    "[WB/Playwright] Используется прокси %s",
+                    sanitize_proxy(proxy_raw),
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "[WB/Playwright] Некорректный прокси %s: %s",
+                    sanitize_proxy(proxy_raw),
+                    exc,
+                )
+                if not self._playwright_proxy_static:
                     self._proxy_current = None
                     self._proxy_force_rotate = False
+                proxy_raw = None
+                rotated = 0
+
+        self._proxy_rotated_flag = rotated
         self._browser = await self._playwright_manager.chromium.launch(**launch_kwargs)
 
     async def _initialize_browser_context(self, context: "BrowserContext") -> None:
@@ -808,7 +826,7 @@ class WildberriesClient:
             self._browser = None
 
         self._html_context_user_agent = None
-        if self._proxy_cycle is not None:
+        if self._proxy_pool_defined and not self._playwright_proxy_static:
             self._proxy_force_rotate = True
 
     async def _load_cookies_from_disk(self) -> tuple[list[dict[str, Any]] | None, float | None]:
@@ -907,11 +925,12 @@ class WildberriesClient:
             "top_items": list(top_items or []),
             "html_ids": page_meta.html_ids,
             "html_enriched": page_meta.html_enriched,
-            "proxy": _mask_proxy(self._proxy_current),
+            "slow": bool(page_meta.slow_mode),
+            "proxy": sanitize_proxy(self._proxy_current),
             "proxy_rotated": self._proxy_rotated_flag,
         }
         self._last_page_logs.append(summary)
-        proxy_used = _mask_proxy(self._proxy_current)
+        proxy_used = sanitize_proxy(self._proxy_current)
         proxy_rotated = self._proxy_rotated_flag
         self._proxy_rotated_flag = 0
 
@@ -930,7 +949,7 @@ class WildberriesClient:
         timing_int = int(page_meta.timing_ms) if page_meta.timing_ms else 0
         logger.info(
             "WB page=%s source=%s status=%s products=%s limit=%s dest=%s spp=%s "
-            "cache=%s timing=%sms%s",
+            "cache=%s slow=%s timing=%sms%s",
             page,
             page_meta.source,
             page_meta.status,
@@ -939,6 +958,7 @@ class WildberriesClient:
             page_meta.dest,
             page_meta.spp,
             page_meta.cache,
+            bool(page_meta.slow_mode),
             timing_int,
             extra_suffix,
         )
@@ -1034,6 +1054,7 @@ class WildberriesClient:
                         had_429=False,
                         limit=limit,
                         timing_ms=(time.monotonic() - start_time) * 1000,
+                        slow_mode=False,
                     )
 
                 # Первая попытка каталога
@@ -1072,6 +1093,7 @@ class WildberriesClient:
                         had_429=encountered_429,
                         limit=limit,
                         timing_ms=(time.monotonic() - start_time) * 1000,
+                        slow_mode=encountered_429,
                     )
 
                 first_attempt = attempts_made == 1
@@ -1130,6 +1152,7 @@ class WildberriesClient:
                         had_429=encountered_429,
                         limit=limit,
                         timing_ms=(time.monotonic() - start_time) * 1000,
+                        slow_mode=encountered_429,
                     )
 
                 if status_alt in {404, 429} or not products_alt:
@@ -1204,7 +1227,8 @@ class WildberriesClient:
             delay_range = (1.5, 2.5) if slow_mode_next else (0.3, 0.8)
             slow_mode_next = False
             if (
-                self._proxy_cycle is not None
+                self._proxy_pool_defined
+                and not self._playwright_proxy_static
                 and self._proxy_current is not None
                 and self._proxy_uses >= self._proxy_sticky_pages
             ):
@@ -1408,12 +1432,12 @@ class WildberriesClient:
             if html_block_detected or (last_status in {403, 498}):
                 consecutive_blocks += 1
                 slow_mode_next = True
-                if self._proxy_cycle is not None:
+                if self._proxy_pool_defined and not self._playwright_proxy_static:
                     self._proxy_uses = self._proxy_sticky_pages
-                if self._proxy_cycle is not None and (last_status in {403, 498}):
-                    self._proxy_force_rotate = True
+                    if last_status in {403, 498}:
+                        self._proxy_force_rotate = True
                 if consecutive_blocks >= 3:
-                    if self._proxy_cycle is not None:
+                    if self._proxy_pool_defined and not self._playwright_proxy_static:
                         self._proxy_force_rotate = True
                     await self._close_browser_context_locked()
                     await asyncio.sleep(random.uniform(1.2, 2.4))
@@ -1423,7 +1447,7 @@ class WildberriesClient:
                 nm_ids = []
                 continue
 
-            if self._proxy_cycle is not None:
+            if self._proxy_pool_defined and not self._playwright_proxy_static:
                 self._proxy_uses += 1
 
             if nm_ids:
@@ -1435,6 +1459,8 @@ class WildberriesClient:
             await self._persist_browser_state(self._browser_context)
 
         nm_ids = nm_ids[:MAX_HTML_IDS]
+
+        slow_flag = attempt > 1
 
         if not nm_ids:
             return PageFetchMeta(
@@ -1450,6 +1476,7 @@ class WildberriesClient:
                 timing_ms=(time.monotonic() - start_time) * 1000,
                 html_ids=0,
                 html_enriched=0,
+                slow_mode=slow_flag,
             )
 
         detail_map = await self._fetch_details(
@@ -1492,6 +1519,7 @@ class WildberriesClient:
             timing_ms=(time.monotonic() - start_time) * 1000,
             html_ids=len(nm_ids),
             html_enriched=enriched_count,
+            slow_mode=slow_flag,
         )
 
     async def _request_with_backoff(
@@ -1709,11 +1737,13 @@ class WildberriesClient:
             return aggregated
 
         if client is None:
+            local_transport = make_httpx_transport(self._httpx_proxy_raw)
             async with httpx.AsyncClient(
                 timeout=timeout,
                 headers=request_headers,
                 follow_redirects=True,
                 http2=self._http2_enabled,
+                transport=local_transport,
             ) as local_client:
                 return await _fetch_batches(local_client)
 

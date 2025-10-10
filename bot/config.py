@@ -30,7 +30,10 @@ class Settings(BaseSettings):
         env="YOOKASSA_RETURN_URL",
     )
 
-    model_config = SettingsConfigDict(env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(
+        env_file_encoding="utf-8",
+        extra="ignore",  # разрешаем сторонние переменные окружения
+    )
 
 
 @lru_cache()
