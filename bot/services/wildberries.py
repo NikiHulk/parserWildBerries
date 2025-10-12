@@ -17,11 +17,12 @@ from urllib.parse import quote, quote_plus
 import httpx
 
 if TYPE_CHECKING:  # pragma: no cover - только для типов
-    from playwright.async_api import BrowserContext
+    from playwright.async_api import APIRequestContext, BrowserContext
 
 logger = logging.getLogger(__name__)
 
-DETAIL_API_URL = "https://card.wb.ru/cards/v1/detail"
+DETAIL_API_URL_V2 = "https://card.wb.ru/cards/v2/detail"
+DETAIL_API_URL_V4 = "https://card.wb.ru/cards/v4/detail"
 
 HEADERS = {
     "User-Agent": (
@@ -53,7 +54,8 @@ HTML_SETTLE_MS = int(os.getenv("PLAYWRIGHT_THROTTLE_MS", "800") or "800")
 START_LIMIT = 20
 MAX_CATALOG_ATTEMPTS = 2
 PAGE_DELAY_RANGE = (0.30, 0.70)
-DETAIL_BATCH = 100
+DETAIL_BATCH = 30
+DETAIL_MAX_ATTEMPTS = 3
 MAX_HTML_IDS = 120
 
 from bot.utils.proxy import (
@@ -275,6 +277,9 @@ class WildberriesClient:
         self._consecutive_anti_bot = 0
         self._resource_block_route_installed = False
         self._resource_block_handler = None
+        self._request_context: "APIRequestContext" | None = None
+        self._request_context_proxy: str | None = None
+        self._request_context_lock = asyncio.Lock()
 
     @staticmethod
     def _detect_http2_support() -> bool:
@@ -350,6 +355,7 @@ class WildberriesClient:
             self._proxy_rotated_flag = 0
         self._proxy_current = new_proxy or self._httpx_proxy_env
         self._set_active_proxy(self._proxy_current)
+        self._schedule_request_context_reset()
         if slow_next:
             self._slow_mode_active = True
 
@@ -717,7 +723,7 @@ class WildberriesClient:
 
         async def handler(route):  # type: ignore[no-untyped-def]
             try:
-                if route.request.resource_type in {"image", "font", "media", "stylesheet"}:
+                if route.request.resource_type in {"image", "font", "media"}:
                     await route.abort()
                 else:
                     await route.continue_()
@@ -731,9 +737,7 @@ class WildberriesClient:
         self._resource_block_route_installed = True
         self._resource_block_handler = handler
 
-    async def _ensure_browser_context(
-        self, *, force_refresh: bool = False
-    ) -> "BrowserContext":
+    async def _ensure_playwright_manager(self) -> None:
         try:
             from playwright.async_api import async_playwright
         except ImportError:
@@ -742,6 +746,12 @@ class WildberriesClient:
             )
             raise
 
+        if self._playwright_manager is None:
+            self._playwright_manager = await async_playwright().start()
+
+    async def _ensure_browser_context(
+        self, *, force_refresh: bool = False
+    ) -> "BrowserContext":
         async with self._browser_lock:
             now = time.time()
             if force_refresh:
@@ -750,8 +760,7 @@ class WildberriesClient:
             if self._browser_context is not None:
                 return self._browser_context
 
-            if self._playwright_manager is None:
-                self._playwright_manager = await async_playwright().start()
+            await self._ensure_playwright_manager()
 
             if self._browser is None:
                 await self._launch_browser_locked()
@@ -895,6 +904,8 @@ class WildberriesClient:
             await self._save_cookies_to_disk(filtered)
 
     async def _close_browser_context_locked(self) -> None:
+        await self._reset_request_context()
+
         if self._browser_context is not None:
             try:
                 await self._browser_context.close()
@@ -912,6 +923,103 @@ class WildberriesClient:
             self._browser = None
 
         self._html_context_user_agent = None
+
+    async def _reset_request_context(self) -> None:
+        async with self._request_context_lock:
+            context = self._request_context
+            if context is None:
+                self._request_context_proxy = None
+                return
+            self._request_context = None
+            self._request_context_proxy = None
+
+        try:
+            await context.dispose()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[WB/detail] Ошибка закрытия request context: %s", exc)
+
+    async def _safe_dispose_request_context(
+        self, context: "APIRequestContext" | None
+    ) -> None:
+        if context is None:
+            return
+        try:
+            await context.dispose()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[WB/detail] Ошибка закрытия request context: %s", exc)
+
+    def _schedule_request_context_reset(self) -> None:
+        context = self._request_context
+        if context is None:
+            self._request_context_proxy = None
+            return
+
+        self._request_context = None
+        self._request_context_proxy = None
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                asyncio.run(self._safe_dispose_request_context(context))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[WB/detail] Ошибка закрытия request context: %s", exc)
+            return
+
+        loop.create_task(self._safe_dispose_request_context(context))
+
+    async def _get_request_context(self) -> "APIRequestContext":
+        await self._ensure_playwright_manager()
+
+        proxy_raw = self._proxy_current or self._httpx_proxy_env
+        proxy_dict: dict[str, str] | None = None
+        if proxy_raw:
+            try:
+                proxy_dict = parse_proxy_url(proxy_raw)
+            except ValueError as exc:
+                logger.warning(
+                    "[WB/detail] Некорректный прокси %s: %s", sanitize_proxy(proxy_raw), exc
+                )
+                proxy_raw = None
+
+        headers = {
+            "User-Agent": self._headers.get("User-Agent", DEFAULT_DESKTOP_UA),
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://www.wildberries.ru/",
+            "Origin": "https://www.wildberries.ru",
+        }
+
+        async with self._request_context_lock:
+            if (
+                self._request_context is not None
+                and self._request_context_proxy == proxy_raw
+            ):
+                return self._request_context
+
+            context_to_close = self._request_context
+            if context_to_close is not None:
+                self._request_context = None
+                self._request_context_proxy = None
+
+            if self._playwright_manager is None:
+                await self._ensure_playwright_manager()
+
+            context = await self._playwright_manager.request.new_context(
+                proxy=proxy_dict,
+                ignore_https_errors=True,
+                extra_http_headers=headers,
+            )
+            self._request_context = context
+            self._request_context_proxy = proxy_raw
+
+        if context_to_close is not None:
+            await self._safe_dispose_request_context(context_to_close)
+
+        logger.info(
+            "[WB/detail] Создан request context для прокси %s",
+            sanitize_proxy(proxy_raw) or "-",
+        )
+        return self._request_context  # type: ignore[return-value]
 
     async def _load_cookies_from_disk(self) -> tuple[list[dict[str, Any]] | None, float | None]:
         def _load() -> tuple[list[dict[str, Any]] | None, float | None]:
@@ -974,6 +1082,28 @@ class WildberriesClient:
                 }
             )
         return filtered
+
+    def _cookie_int(self, *names: str) -> int | None:
+        """Возвращает числовое значение cookie, если оно доступно."""
+
+        if not names:
+            return None
+
+        lookup = {name.lower() for name in names if name}
+        if not lookup:
+            return None
+
+        for cookie in self._cookie_cache or []:
+            name = str(cookie.get("name") or "").lower()
+            if name not in lookup:
+                continue
+            raw_value = str(cookie.get("value") or "").strip()
+            try:
+                return int(raw_value)
+            except ValueError:
+                continue
+
+        return None
 
     @property
     def last_page_logs(self) -> list[dict[str, Any]]:
@@ -1284,7 +1414,13 @@ class WildberriesClient:
         start_time: float,
     ) -> PageFetchMeta:
         """HTML fallback using Playwright with safe launch args and HTTP/2 disabled."""
-        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        try:
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        except ImportError:
+            logger.error(
+                "Playwright не установлен. Установите 'playwright' и выполните 'playwright install chromium'."
+            )
+            raise
 
         html_url = url_html_search(query, page)
         nm_ids: list[int] = []
@@ -1392,8 +1528,7 @@ class WildberriesClient:
                     html_text_snapshot = await page_obj.content()
                 except Exception:  # noqa: BLE001
                     html_text_snapshot = ""
-
-                last_html_length = len(html_text_snapshot)
+                last_html_length = len(html_text_snapshot or "")
                 html_block_detected = anti_bot_detected(last_status, html_text_snapshot)
                 last_html_anti_bot = html_block_detected
 
@@ -1404,6 +1539,13 @@ class WildberriesClient:
                         last_status,
                         bool(html_text_snapshot),
                         proxy_for_log or "-",
+                    )
+                    logger.info(
+                        "[WB/Playwright] page diagnostics: proxy=%s anti_bot=%s len_html=%s ids_found=%s",
+                        proxy_for_log or "-",
+                        True,
+                        last_html_length,
+                        0,
                     )
                 else:
                     await page_obj.wait_for_timeout(random.randint(1200, 2000))
@@ -1460,6 +1602,19 @@ class WildberriesClient:
                                 len(ids_from_dom),
                             )
 
+                    ids_found_count = (
+                        len(nm_ids)
+                        or len(ids_from_xhr)
+                        or len(ids_from_dom)
+                    )
+                    logger.info(
+                        "[WB/Playwright] page diagnostics: proxy=%s anti_bot=%s len_html=%s ids_found=%s",
+                        proxy_for_log or "-",
+                        False,
+                        last_html_length,
+                        ids_found_count,
+                    )
+
                 if not nm_ids and not html_block_detected:
                     html_block_detected = True
 
@@ -1491,7 +1646,7 @@ class WildberriesClient:
                 except Exception:  # noqa: BLE001
                     pass
                 try:
-                    page_obj.unroute("**/*", resource_gate)
+                    await page_obj.unroute("**/*", resource_gate)
                 except Exception:  # noqa: BLE001
                     pass
                 try:
@@ -1799,43 +1954,104 @@ class WildberriesClient:
         *,
         timeout: float,
         headers: Mapping[str, str] | None = None,
-        client: httpx.AsyncClient | None = None,
+        client: httpx.AsyncClient | None = None,  # сохраняем параметр для совместимости
     ) -> Mapping[int, dict[str, Any]]:
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+        _ = headers, client  # параметры сохраняем для совместимости с сигнатурой
+
         id_strings = [str(pid) for pid in product_ids]
         if not id_strings:
             return {}
 
-        request_headers = dict(headers or self._headers)
-        request_headers.setdefault("Accept-Encoding", HEADERS["Accept-Encoding"])
+        dest = self._cookie_int("dest", "x-dest", "x-dest-id") or -1257786
+        spp = self._cookie_int("spp", "x-spp") or 0
 
-        async def _fetch_batches(active_client: httpx.AsyncClient) -> Mapping[int, dict[str, Any]]:
-            aggregated: dict[int, dict[str, Any]] = {}
-            for start in range(0, len(id_strings), DETAIL_BATCH):
-                batch = id_strings[start : start + DETAIL_BATCH]
-                params = {
-                    "appType": 1,
-                    "curr": "rub",
-                    "dest": -1257786,
-                    "nm": ",".join(batch),
-                }
-                response, _ = await self._request_with_backoff(
-                    "GET",
-                    DETAIL_API_URL,
-                    headers=request_headers,
-                    timeout=timeout,
-                    params=params,
+        aggregated: dict[int, dict[str, Any]] = {}
+        proxy_for_log = sanitize_proxy(self._proxy_current or self._httpx_proxy_env)
+        timeout_ms = max(int(timeout * 1000), 5000)
+
+        async def fetch_variant(
+            ctx: "APIRequestContext",
+            url: str,
+            batch: list[str],
+            variant: str,
+        ) -> dict[str, Any] | None:
+            params = {
+                "appType": 1,
+                "curr": "rub",
+                "dest": dest,
+                "spp": spp,
+                "nm": ",".join(batch),
+            }
+            response = await ctx.get(url, params=params, timeout=timeout_ms)
+            status = response.status
+            logger.info(
+                "[WB/detail] via=request_context variant=%s status=%s ids=%s proxy=%s",
+                variant,
+                status,
+                len(batch),
+                proxy_for_log or "-",
+            )
+            if status != 200:
+                await response.dispose()
+                raise RuntimeError(f"status_{status}")
+
+            try:
+                payload = await response.json()
+            except Exception as exc:  # noqa: BLE001
+                await response.dispose()
+                logger.warning(
+                    "[WB/detail] JSON error variant=%s ids=%s: %s", variant, len(batch), exc
                 )
-                if response is None:
-                    continue
+                if variant == "v2":
+                    return None
+                raise
+
+            await response.dispose()
+            return payload
+
+        for start in range(0, len(id_strings), DETAIL_BATCH):
+            batch = id_strings[start : start + DETAIL_BATCH]
+            attempts = 0
+            while attempts < DETAIL_MAX_ATTEMPTS:
+                attempts += 1
+                proxy_for_log = sanitize_proxy(self._proxy_current or self._httpx_proxy_env)
                 try:
-                    payload = response.json()
-                except Exception:  # noqa: BLE001
-                    logger.error(
-                        "Не удалось разобрать JSON детализации WB: статус=%s body[:200]=%r",
-                        response.status_code,
-                        (response.text or "")[:200],
-                    )
+                    ctx = await self._get_request_context()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[WB/detail] Не удалось подготовить request context: %s", exc)
+                    await asyncio.sleep(min(0.4 * attempts, 1.2))
                     continue
+
+                try:
+                    payload = await fetch_variant(ctx, DETAIL_API_URL_V2, batch, "v2")
+                    if payload is None:
+                        payload = await fetch_variant(ctx, DETAIL_API_URL_V4, batch, "v4")
+                except PlaywrightTimeoutError as exc:
+                    logger.warning(
+                        "[WB/detail] timeout variant=v2 ids=%s proxy=%s: %s",
+                        len(batch),
+                        proxy_for_log or "-",
+                        exc,
+                    )
+                    self._rotate_proxy("detail_timeout", slow_next=True)
+                    await asyncio.sleep(min(0.4 * attempts, 1.2))
+                    continue
+                except RuntimeError as exc:
+                    status_reason = str(exc)
+                    self._rotate_proxy(f"detail_{status_reason}", slow_next=True)
+                    await asyncio.sleep(min(0.4 * attempts, 1.2))
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[WB/detail] Ошибка детализации: %s", exc)
+                    self._rotate_proxy("detail_error", slow_next=True)
+                    await asyncio.sleep(min(0.4 * attempts, 1.2))
+                    continue
+
+                if not payload:
+                    logger.warning("[WB/detail] Пустой ответ детализации для %s", len(batch))
+                    break
 
                 details = payload.get("data", {}).get("products", [])
                 for item in details:
@@ -1844,20 +2060,15 @@ class WildberriesClient:
                             aggregated[int(item.get("id"))] = dict(item)
                         except (TypeError, ValueError):
                             continue
-            return aggregated
+                break
+            else:
+                logger.warning(
+                    "[WB/detail] Не удалось обогатить %s товаров после %s попыток",
+                    len(batch),
+                    DETAIL_MAX_ATTEMPTS,
+                )
 
-        if client is None:
-            local_transport = make_httpx_transport(self._current_http_proxy_raw())
-            async with httpx.AsyncClient(
-                timeout=timeout,
-                headers=request_headers,
-                follow_redirects=True,
-                http2=self._http2_enabled,
-                transport=local_transport,
-            ) as local_client:
-                return await _fetch_batches(local_client)
-
-        return await _fetch_batches(client)
+        return aggregated
 
     def _build_product(
         self,
