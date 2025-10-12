@@ -35,6 +35,11 @@ HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
 }
 
+DEFAULT_DESKTOP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+
 COOKIE_TTL_SECONDS = 6 * 60 * 60
 PLAYWRIGHT_USER_DATA_DIR = Path(
     os.getenv("PLAYWRIGHT_USER_DATA_DIR", "data")
@@ -255,6 +260,8 @@ class WildberriesClient:
             "--disable-dev-shm-usage",
             "--lang=ru-RU,ru",
             "--disable-blink-features=AutomationControlled",
+            "--disable-http2",
+            "--disable-features=NetworkServiceInProcess",
         ]
         self._playwright_manager = None
         self._browser = None
@@ -774,21 +781,27 @@ class WildberriesClient:
 
             user_agent = self._pick_user_agent()
             timezone_id = os.getenv("PLAYWRIGHT_TZ", "Europe/Moscow")
+            ua_to_use = user_agent or DEFAULT_DESKTOP_UA
             context_kwargs = {
-                "user_agent": user_agent,
+                "user_agent": ua_to_use,
                 "locale": "ru-RU",
-                "java_script_enabled": True,
-                "viewport": {"width": 1366, "height": 864},
                 "timezone_id": timezone_id,
-                "permissions": ["geolocation"],
-                "geolocation": {"longitude": 37.6173, "latitude": 55.7558},
+                "ignore_https_errors": True,
                 "extra_http_headers": {
-                    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+                    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
                     "Cache-Control": "no-cache",
                     "Pragma": "no-cache",
                     "Upgrade-Insecure-Requests": "1",
                 },
+                "viewport": {"width": 1366, "height": 864},
             }
+            context_kwargs.update(
+                {
+                    "java_script_enabled": True,
+                    "permissions": ["geolocation"],
+                    "geolocation": {"longitude": 37.6173, "latitude": 55.7558},
+                }
+            )
             if storage_state_arg:
                 context_kwargs["storage_state"] = storage_state_arg
                 logger.info(
@@ -1270,6 +1283,7 @@ class WildberriesClient:
         encountered_429: bool,
         start_time: float,
     ) -> PageFetchMeta:
+        """HTML fallback using Playwright with safe launch args and HTTP/2 disabled."""
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
         html_url = url_html_search(query, page)
@@ -1278,6 +1292,10 @@ class WildberriesClient:
         max_attempts = 6
         attempt = 0
         slow_mode_used = self._slow_mode_active
+        ids_from_xhr: list[int] = []
+        ids_from_dom: list[int] = []
+        last_html_length = 0
+        last_html_anti_bot = False
 
         def anti_bot_detected(status: int | None, body: str | None) -> bool:
             if status in {403, 497, 498}:
@@ -1321,6 +1339,10 @@ class WildberriesClient:
             responses: list[dict[str, Any]] = []
             last_status: int | None = None
             html_block_detected = False
+            rotated_in_exception = False
+            html_text_snapshot = ""
+            ids_from_xhr = []
+            ids_from_dom = []
 
             async def capture_response(resp) -> None:  # type: ignore[no-untyped-def]
                 try:
@@ -1342,6 +1364,23 @@ class WildberriesClient:
 
             page_obj.on("response", capture_response)
 
+            async def resource_gate(route):  # type: ignore[no-untyped-def]
+                try:
+                    if route.request.resource_type in {"image", "media", "font"}:
+                        await route.abort()
+                    else:
+                        await route.continue_()
+                except Exception:  # noqa: BLE001
+                    try:
+                        await route.abort()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            try:
+                await page_obj.route("**/*", resource_gate)
+            except Exception:  # noqa: BLE001
+                pass
+
             try:
                 goto_response = await page_obj.goto(
                     html_url,
@@ -1350,35 +1389,34 @@ class WildberriesClient:
                 )
                 last_status = goto_response.status if goto_response is not None else None
                 try:
-                    body_text = await page_obj.content()
+                    html_text_snapshot = await page_obj.content()
                 except Exception:  # noqa: BLE001
-                    body_text = None
+                    html_text_snapshot = ""
 
-                if anti_bot_detected(last_status, body_text):
+                last_html_length = len(html_text_snapshot)
+                html_block_detected = anti_bot_detected(last_status, html_text_snapshot)
+                last_html_anti_bot = html_block_detected
+
+                if html_block_detected:
                     html_block_detected = True
                     logger.warning(
                         "[WB/Playwright] anti-bot: status=%s pattern=%s proxy=%s",
                         last_status,
-                        bool(body_text),
+                        bool(html_text_snapshot),
                         proxy_for_log or "-",
                     )
                 else:
-                    await page_obj.wait_for_timeout(int(random.uniform(4000, 6000)))
+                    await page_obj.wait_for_timeout(random.randint(1200, 2000))
                     try:
                         await page_obj.wait_for_selector("input#searchInput", timeout=5000)
                     except PlaywrightTimeoutError:
                         pass
-                    await page_obj.wait_for_timeout(int(random.uniform(100, 300)))
-                    try:
-                        await page_obj.mouse.move(150, 150, steps=6)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    await page_obj.wait_for_timeout(int(random.uniform(150, 350)))
-                    try:
-                        await page_obj.mouse.wheel(0, 800)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    await page_obj.wait_for_timeout(int(random.uniform(2000, 3500)))
+                    for _ in range(3):
+                        try:
+                            await page_obj.mouse.wheel(0, random.randint(900, 1400))
+                        except Exception:  # noqa: BLE001
+                            pass
+                        await page_obj.wait_for_timeout(random.randint(500, 900))
 
                     if responses:
                         logger.info("[WB/Playwright] JSON XHR найден: %s", len(responses))
@@ -1391,43 +1429,69 @@ class WildberriesClient:
                                     except (TypeError, ValueError):
                                         continue
                         if collected:
-                            nm_ids = list(dict.fromkeys(collected))
+                            ids_from_xhr = list(dict.fromkeys(collected))
+                            nm_ids = list(ids_from_xhr)
                             source = "html_xhr"
 
                     if not nm_ids:
                         try:
-                            links = await page_obj.eval_on_selector_all(
-                                'a[href*="/catalog/"][href*="/detail"]',
-                                'els => els.map(a => a.href)',
+                            hrefs = await page_obj.eval_on_selector_all(
+                                'a[href*="/catalog/"][href$="/detail.aspx"]',
+                                "els => els.slice(0,60).map(a => a.href)",
                             )
                         except Exception:  # noqa: BLE001
-                            links = []
+                            hrefs = []
                         logger.info(
                             "[WB/Playwright] DOM карточек: %s, XHR карточек: %s",
-                            len(links or []),
+                            len(hrefs or []),
                             len(responses),
                         )
                         dom_collected: list[int] = []
-                        for href in links or []:
+                        for href in hrefs or []:
                             match = re.search(r"/catalog/(\d+)/detail\.aspx", href or "")
                             if match:
                                 dom_collected.append(int(match.group(1)))
                         if dom_collected:
-                            nm_ids = list(dict.fromkeys(dom_collected))
+                            ids_from_dom = list(dict.fromkeys(dom_collected))
+                            nm_ids = list(ids_from_dom)
                             source = "html_dom"
+                            logger.info(
+                                "[WB/Playwright] HTML DOM fallback recovered %d ids",
+                                len(ids_from_dom),
+                            )
 
                 if not nm_ids and not html_block_detected:
                     html_block_detected = True
 
             except PlaywrightTimeoutError as exc:
-                logger.warning("[WB/Playwright] timeout: stage=goto error=%s proxy=%s", exc, proxy_for_log or "-")
+                logger.warning(
+                    "[WB/Playwright] timeout: stage=goto error=%s proxy=%s",
+                    exc,
+                    proxy_for_log or "-",
+                )
                 html_block_detected = True
+                rotated_in_exception = True
+                self._consecutive_anti_bot += 1
+                if self._proxy_pool_defined or self._proxy_current or self._httpx_proxy_env:
+                    self._rotate_proxy("pw_timeout", slow_next=True)
+                else:
+                    self._slow_mode_active = True
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[WB/Playwright] Ошибка Playwright: %s", exc)
                 html_block_detected = True
+                rotated_in_exception = True
+                self._consecutive_anti_bot += 1
+                if self._proxy_pool_defined or self._proxy_current or self._httpx_proxy_env:
+                    self._rotate_proxy("pw_error", slow_next=True)
+                else:
+                    self._slow_mode_active = True
             finally:
                 try:
                     page_obj.off("response", capture_response)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    page_obj.unroute("**/*", resource_gate)
                 except Exception:  # noqa: BLE001
                     pass
                 try:
@@ -1436,14 +1500,18 @@ class WildberriesClient:
                     pass
 
             if html_block_detected:
-                self._consecutive_anti_bot += 1
-                slow_next = self._consecutive_anti_bot >= 3
-                if self._proxy_pool_defined or self._proxy_current or self._httpx_proxy_env:
-                    self._rotate_proxy(
-                        f"pw_antibot_{last_status or 'unknown'}",
-                        slow_next=slow_next,
-                    )
-                elif slow_next:
+                if not rotated_in_exception:
+                    self._consecutive_anti_bot += 1
+                    slow_next = self._consecutive_anti_bot >= 3
+                    if self._proxy_pool_defined or self._proxy_current or self._httpx_proxy_env:
+                        self._rotate_proxy(
+                            f"pw_antibot_{last_status or 'unknown'}",
+                            slow_next=slow_next,
+                        )
+                    elif slow_next:
+                        self._slow_mode_active = True
+                slow_next_flag = self._consecutive_anti_bot >= 3
+                if slow_next_flag and not self._proxy_pool_defined and not rotated_in_exception:
                     self._slow_mode_active = True
                 self._http_client_needs_restart = True
                 await self._close_browser_context_locked()
@@ -1459,6 +1527,19 @@ class WildberriesClient:
         nm_ids = nm_ids[:MAX_HTML_IDS]
 
         if not nm_ids:
+            proxy_for_empty = sanitize_proxy(
+                self._proxy_current or self._current_http_proxy_raw()
+            )
+            logger.info(
+                "source=%s page=%s status=html_empty ids=0 enriched=0 slow=%s proxy=%s timing=%dms anti_bot=%s len_html=%s ids_found=0",
+                source,
+                page,
+                self._slow_mode_active or slow_mode_used,
+                proxy_for_empty or "-",
+                int((time.monotonic() - start_time) * 1000),
+                last_html_anti_bot,
+                last_html_length,
+            )
             return PageFetchMeta(
                 products=[],
                 source=source,
@@ -1508,8 +1589,11 @@ class WildberriesClient:
         proxy_for_meta = sanitize_proxy(
             self._proxy_current or self._current_http_proxy_raw()
         )
+        ids_found = len(ids_from_xhr) if ids_from_xhr else len(ids_from_dom)
+        if not ids_found:
+            ids_found = len(nm_ids)
         logger.info(
-            "source=%s page=%s status=ok ids=%s enriched=%s slow=%s proxy=%s timing=%dms",
+            "source=%s page=%s status=ok ids=%s enriched=%s slow=%s proxy=%s timing=%dms anti_bot=%s len_html=%s ids_found=%s",
             source,
             page,
             len(nm_ids),
@@ -1517,6 +1601,9 @@ class WildberriesClient:
             self._slow_mode_active or slow_mode_used,
             proxy_for_meta or "-",
             int(timing_ms),
+            last_html_anti_bot,
+            last_html_length,
+            ids_found,
         )
 
         return PageFetchMeta(
