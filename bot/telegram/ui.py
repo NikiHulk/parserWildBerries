@@ -2,22 +2,52 @@
 
 from __future__ import annotations
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 
 SEARCH_BUTTON = "🔎 Поиск"
+SETTINGS_BUTTON = "⚙️ Настройки"
+HELP_BUTTON = "ℹ️ Помощь"
 CANCEL_BUTTON = "❌ Отмена"
 
 
 def main_kb() -> ReplyKeyboardMarkup:
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add(KeyboardButton(SEARCH_BUTTON))
-    return keyboard
+    """Main menu keyboard shown in idle state."""
+
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=SEARCH_BUTTON)],
+            [
+                KeyboardButton(text=SETTINGS_BUTTON),
+                KeyboardButton(text=HELP_BUTTON),
+            ],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Выберите действие",
+    )
 
 
 def cancel_kb() -> ReplyKeyboardMarkup:
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, selective=True)
-    keyboard.add(KeyboardButton(CANCEL_BUTTON))
-    return keyboard
+    """Standalone cancel keyboard (legacy scenarios)."""
+
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=CANCEL_BUTTON)]],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Отправьте текст или отмените",
+    )
+
+
+def remove_kb() -> ReplyKeyboardRemove:
+    """Hide reply keyboard to allow free text input."""
+
+    return ReplyKeyboardRemove()
 
 
 def pager_kb(page: int, total_pages: int) -> InlineKeyboardMarkup:

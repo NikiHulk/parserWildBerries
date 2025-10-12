@@ -18,7 +18,7 @@ from aiogram.types import CallbackQuery, Message
 from ..config import get_settings
 from ..services.wildberries import WildberriesClient, build_image_url
 from .render import build_caption
-from .ui import CANCEL_BUTTON, SEARCH_BUTTON, cancel_kb, main_kb, pager_kb
+from .ui import CANCEL_BUTTON, SEARCH_BUTTON, main_kb, pager_kb, remove_kb
 
 router = Router()
 
@@ -32,6 +32,18 @@ class SearchStates(StatesGroup):
     entering_max_price = State()
     entering_excludes = State()
     showing_results = State()
+
+
+def _is_cancel(text: str | None) -> bool:
+    if not text:
+        return False
+    normalized = text.strip().lower()
+    return normalized in {
+        CANCEL_BUTTON.lower(),
+        "отмена",
+        "cancel",
+        "/cancel",
+    }
 
 
 def _parse_price(value: str | None) -> int | None:
@@ -148,6 +160,7 @@ async def _clear_previous_results(bot, chat_id: int, state: FSMContext) -> None:
     data = await state.get_data()
     previous_ids: List[int] = data.get("product_message_ids", [])
     nav_message_id = data.get("nav_message_id")
+    menu_message_id = data.get("menu_message_id")
 
     for message_id in previous_ids:
         try:
@@ -161,9 +174,16 @@ async def _clear_previous_results(bot, chat_id: int, state: FSMContext) -> None:
         except Exception:  # noqa: BLE001
             pass
 
+    if menu_message_id:
+        try:
+            await bot.delete_message(chat_id, menu_message_id)
+        except Exception:  # noqa: BLE001
+            pass
+
     await state.update_data(
         product_message_ids=[],
         nav_message_id=None,
+        menu_message_id=None,
     )
 
 
@@ -171,6 +191,7 @@ async def _send_page(bot, chat_id: int, state: FSMContext, items: List[Dict[str,
     data = await state.get_data()
     previous_ids: List[int] = data.get("product_message_ids", [])
     nav_message_id = data.get("nav_message_id")
+    menu_message_id = data.get("menu_message_id")
 
     for message_id in previous_ids:
         try:
@@ -237,7 +258,16 @@ async def _send_page(bot, chat_id: int, state: FSMContext, items: List[Dict[str,
         nav_message_id=nav_message_id,
         results=items,
         page=page,
+        menu_message_id=menu_message_id,
     )
+
+    if not menu_message_id:
+        menu_message = await bot.send_message(
+            chat_id,
+            "Вы можете начать новый поиск через меню ниже.",
+            reply_markup=main_kb(),
+        )
+        await state.update_data(menu_message_id=menu_message.message_id)
 
 
 @router.message(CommandStart())
@@ -252,33 +282,39 @@ async def start_flow(message: Message, state: FSMContext) -> None:
     await _clear_previous_results(message.bot, message.chat.id, state)
     await state.set_state(SearchStates.entering_query)
     await message.answer(
-        "Введите название товара:",
-        reply_markup=cancel_kb(),
+        "Введите название товара (для отмены отправьте «❌ Отмена»):",
+        reply_markup=remove_kb(),
     )
 
 
 @router.message(SearchStates.entering_query)
 async def handle_query(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
-    if text == CANCEL_BUTTON:
+    if _is_cancel(text):
         await state.clear()
         await message.answer(WELCOME_TEXT, reply_markup=main_kb())
         return
     if not text:
-        await message.answer("Название не может быть пустым. Попробуйте ещё раз.")
+        await message.answer(
+            "Название не может быть пустым. Попробуйте ещё раз.",
+            reply_markup=remove_kb(),
+        )
         return
     await state.update_data(query=text)
     await state.set_state(SearchStates.entering_max_price)
     await message.answer(
-        "Верхний порог цены (рубли). Оставьте пустым или отправьте «пропустить», если ограничение не нужно:",
-        reply_markup=cancel_kb(),
+        (
+            "Верхний порог цены (рубли). Оставьте пустым или отправьте «пропустить»,"
+            " если ограничение не нужно. Для отмены — «❌ Отмена»."
+        ),
+        reply_markup=remove_kb(),
     )
 
 
 @router.message(SearchStates.entering_max_price)
 async def handle_max_price(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
-    if text == CANCEL_BUTTON:
+    if _is_cancel(text):
         await state.clear()
         await message.answer(WELCOME_TEXT, reply_markup=main_kb())
         return
@@ -290,20 +326,24 @@ async def handle_max_price(message: Message, state: FSMContext) -> None:
         except ValueError:
             await message.answer(
                 "Не удалось распознать цену. Введите целое число или оставьте поле пустым.",
+                reply_markup=remove_kb(),
             )
             return
     await state.update_data(max_price=price)
     await state.set_state(SearchStates.entering_excludes)
     await message.answer(
-        "Исключающие слова (через запятую). Например: б/у, восстановленный. Можно отправить пустое сообщение.",
-        reply_markup=cancel_kb(),
+        (
+            "Исключающие слова (через запятую). Например: б/у, восстановленный."
+            " Можно отправить пустое сообщение. Для отмены — «❌ Отмена»."
+        ),
+        reply_markup=remove_kb(),
     )
 
 
 @router.message(SearchStates.entering_excludes)
 async def handle_excludes(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
-    if text == CANCEL_BUTTON:
+    if _is_cancel(text):
         await _clear_previous_results(message.bot, message.chat.id, state)
         await state.clear()
         await message.answer(WELCOME_TEXT, reply_markup=main_kb())
