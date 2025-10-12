@@ -17,6 +17,14 @@ class Settings(BaseSettings):
     )
     request_timeout: float = Field(default=10.0, env="REQUEST_TIMEOUT")
     max_results: int = Field(default=10, env="MAX_RESULTS")
+    tg_results_per_page: int = Field(
+        default=8,
+        env="TG_RESULTS_PER_PAGE",
+    )
+    tg_welcome_text: str = Field(
+        default="Добро пожаловать! Нажмите «🔎 Поиск», чтобы найти товар.",
+        env="TG_WELCOME_TEXT",
+    )
     min_rating: float | None = Field(default=None, env="MIN_RATING")
     min_feedbacks: int | None = Field(default=None, env="MIN_FEEDBACKS")
     min_discount: float | None = Field(default=None, env="MIN_DISCOUNT")

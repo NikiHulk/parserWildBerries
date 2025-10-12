@@ -6,10 +6,10 @@ import logging
 from aiogram import Bot, Dispatcher
 
 from .config import get_settings
-from .handlers import filters, search, start
 from .middlewares.subscription import SubscriptionMiddleware
 from .services.banned_words import BannedWordsService
 from .storage.database import Database
+from .telegram.flow_search import router as ui_router
 
 logging.basicConfig(level=logging.INFO)
 
@@ -22,9 +22,7 @@ def _build_dispatcher(banned_words: BannedWordsService) -> Dispatcher:
             # Для возврата платной модели передайте service=SubscriptionService(...) и payments=PaymentService(...)
         )
     )
-    dp.include_router(start.router)
-    dp.include_router(filters.router)
-    dp.include_router(search.router)
+    dp.include_router(ui_router)
     return dp
 
 
