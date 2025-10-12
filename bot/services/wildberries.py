@@ -75,13 +75,13 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
-DETAIL_MAX_CHUNK = max(1, _env_int("WB_DETAIL_MAX_CHUNK", 10))
+DETAIL_MAX_CHUNK = max(1, _env_int("WB_DETAIL_MAX_CHUNK", 24))
 DETAIL_MIN_CHUNK = max(1, _env_int("WB_DETAIL_MIN_CHUNK", 1))
 if DETAIL_MIN_CHUNK > DETAIL_MAX_CHUNK:
     DETAIL_MIN_CHUNK = DETAIL_MAX_CHUNK
-DETAIL_MAX_RETRIES = max(1, _env_int("WB_DETAIL_MAX_RETRIES", 3))
-DETAIL_JITTER_MIN = max(0.0, _env_int("WB_DETAIL_JITTER_MIN_MS", 200) / 1000)
-DETAIL_JITTER_MAX = max(DETAIL_JITTER_MIN, _env_int("WB_DETAIL_JITTER_MAX_MS", 800) / 1000)
+DETAIL_MAX_RETRIES = max(1, _env_int("WB_DETAIL_MAX_RETRIES", 2))
+DETAIL_JITTER_MIN = max(0.0, _env_int("WB_DETAIL_JITTER_MIN_MS", 150) / 1000)
+DETAIL_JITTER_MAX = max(DETAIL_JITTER_MIN, _env_int("WB_DETAIL_JITTER_MAX_MS", 350) / 1000)
 DETAIL_ROTATE_ON_EMPTY = _env_bool("WB_DETAIL_ROTATE_ON_EMPTY", True)
 DETAIL_USE_V4_FALLBACK = _env_bool("WB_DETAIL_USE_V4_FALLBACK", True)
 
@@ -211,6 +211,7 @@ class PageFetchMeta:
     slow_mode: bool = False
     proxy: str | None = None
     proxy_rotated: bool = False
+    html_status: int | None = None
     detail_chunks: int | None = None
     detail_singles: int | None = None
     detail_retries: int | None = None
@@ -218,6 +219,9 @@ class PageFetchMeta:
     detail_time_ms: float | None = None
     detail_dom_only: bool | None = None
     detail_final_chunk: int | None = None
+    detail_batches: int | None = None
+    detail_enriched_total: int | None = None
+    detail_used_v4: bool | None = None
 
 
 class WildberriesClient:
@@ -296,7 +300,6 @@ class WildberriesClient:
             "--disable-dev-shm-usage",
             "--lang=ru-RU,ru",
             "--disable-blink-features=AutomationControlled",
-            "--disable-http2",
             "--disable-features=NetworkServiceInProcess",
         ]
         self._playwright_manager = None
@@ -1241,6 +1244,7 @@ class WildberriesClient:
             "slow": bool(page_meta.slow_mode),
             "proxy": page_meta.proxy or sanitize_proxy(self._proxy_current),
             "proxy_rotated": page_meta.proxy_rotated or self._proxy_rotated_flag,
+            "html_status": page_meta.html_status,
             "detail_chunks": page_meta.detail_chunks,
             "detail_singles": page_meta.detail_singles,
             "detail_retries": page_meta.detail_retries,
@@ -1248,6 +1252,9 @@ class WildberriesClient:
             "detail_time_ms": page_meta.detail_time_ms,
             "detail_dom_only": page_meta.detail_dom_only,
             "detail_final_chunk": page_meta.detail_final_chunk,
+            "detail_batches": page_meta.detail_batches,
+            "detail_enriched_total": page_meta.detail_enriched_total,
+            "detail_used_v4": page_meta.detail_used_v4,
         }
         self._last_page_logs.append(summary)
         proxy_used = summary["proxy"]
@@ -1260,7 +1267,9 @@ class WildberriesClient:
                 extra_parts.append(f"ids={page_meta.html_ids}")
             if page_meta.html_enriched is not None:
                 extra_parts.append(f"enriched={page_meta.html_enriched}")
-        if page_meta.detail_chunks is not None:
+        if page_meta.detail_batches is not None:
+            extra_parts.append(f"detail_batches={page_meta.detail_batches}")
+        elif page_meta.detail_chunks is not None:
             extra_parts.append(f"detail_chunks={page_meta.detail_chunks}")
         if page_meta.detail_singles is not None:
             extra_parts.append(f"detail_singles={page_meta.detail_singles}")
@@ -1274,6 +1283,12 @@ class WildberriesClient:
             extra_parts.append(f"detail_time={int(page_meta.detail_time_ms)}ms")
         if page_meta.detail_final_chunk is not None:
             extra_parts.append(f"detail_final_chunk={page_meta.detail_final_chunk}")
+        if page_meta.detail_enriched_total is not None:
+            extra_parts.append(f"detail_enriched={page_meta.detail_enriched_total}")
+        if page_meta.detail_used_v4:
+            extra_parts.append("detail_used_v4=1")
+        if page_meta.html_status is not None:
+            extra_parts.append(f"html_status={page_meta.html_status}")
         if proxy_used:
             extra_parts.append(f"proxy={proxy_used}")
         if proxy_rotated:
@@ -1533,7 +1548,7 @@ class WildberriesClient:
         encountered_429: bool,
         start_time: float,
     ) -> PageFetchMeta:
-        """HTML fallback using Playwright with safe launch args and HTTP/2 disabled."""
+        """HTML fallback powered by Playwright with proxy-safe launch args and DOM harvesting."""
         try:
             from playwright.async_api import TimeoutError as PlaywrightTimeoutError
         except ImportError:
@@ -1563,6 +1578,81 @@ class WildberriesClient:
                 re.IGNORECASE,
             )
             return bool(pattern.search(body))
+
+        async def collect_dom_ids(page_obj) -> list[int]:  # type: ignore[no-untyped-def]
+            ids: list[int] = []
+            seen: set[int] = set()
+
+            def _extend(source: Iterable[Any]) -> None:
+                for raw in source or []:
+                    try:
+                        nm_value = int(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    if nm_value < 1_000_000:
+                        continue
+                    if nm_value not in seen:
+                        seen.add(nm_value)
+                        ids.append(nm_value)
+
+            try:
+                attr_candidates = await page_obj.eval_on_selector_all(  # type: ignore[attr-defined]
+                    "[data-nm-id], [data-popup-nm-id], [data-id]",
+                    """
+                    (nodes) => nodes
+                        .map((node) => {
+                            const raw = node.getAttribute('data-nm-id')
+                                || node.getAttribute('data-popup-nm-id')
+                                || node.getAttribute('data-id');
+                            const num = Number(raw);
+                            return Number.isFinite(num) ? num : null;
+                        })
+                        .filter((num) => num && num >= 1000000)
+                        .slice(0, 180)
+                    """,
+                )
+            except Exception:  # noqa: BLE001
+                attr_candidates = []
+
+            _extend(attr_candidates or [])
+
+            try:
+                href_candidates = await page_obj.eval_on_selector_all(  # type: ignore[attr-defined]
+                    "a[href]",
+                    """
+                    (nodes) => nodes
+                        .map((node) => {
+                            const href = node.getAttribute('href');
+                            if (!href) {
+                                return null;
+                            }
+                            try {
+                                return new URL(href, window.location.href).href;
+                            } catch (e) {
+                                return null;
+                            }
+                        })
+                        .filter((href) => Boolean(href))
+                        .slice(0, 180)
+                    """,
+                )
+            except Exception:  # noqa: BLE001
+                href_candidates = []
+
+            href_ids: list[int] = []
+            for href in href_candidates or []:
+                if not href:
+                    continue
+                match = re.search(r"/catalog/(\d+)/detail\.aspx", str(href))
+                if match:
+                    try:
+                        href_ids.append(int(match.group(1)))
+                    except (TypeError, ValueError):
+                        continue
+
+            _extend(href_ids)
+
+            return ids[:MAX_HTML_IDS]
 
         while attempt < max_attempts and not nm_ids:
             attempt += 1
@@ -1650,90 +1740,81 @@ class WildberriesClient:
                     html_text_snapshot = ""
                 last_html_length = len(html_text_snapshot or "")
                 html_block_detected = anti_bot_detected(last_status, html_text_snapshot)
-                last_html_anti_bot = html_block_detected
-
                 if html_block_detected:
-                    html_block_detected = True
                     logger.warning(
                         "[WB/Playwright] anti-bot: status=%s pattern=%s proxy=%s",
                         last_status,
                         bool(html_text_snapshot),
                         proxy_for_log or "-",
                     )
-                    logger.info(
-                        "[WB/Playwright] page diagnostics: proxy=%s anti_bot=%s len_html=%s ids_found=%s",
-                        proxy_for_log or "-",
-                        True,
-                        last_html_length,
-                        0,
-                    )
-                else:
-                    await page_obj.wait_for_timeout(random.randint(1200, 2000))
+                last_html_anti_bot = html_block_detected
+
+                throttle_base = max(600, self._html_settle_ms)
+                initial_wait_min = max(1500, int(throttle_base * 1.5))
+                initial_wait_max = max(2200, int(throttle_base * 2.2))
+                await page_obj.wait_for_timeout(random.randint(initial_wait_min, initial_wait_max))
+                try:
+                    await page_obj.wait_for_selector("input#searchInput", timeout=5000)
+                except PlaywrightTimeoutError:
+                    pass
+
+                scroll_iterations = random.randint(2, 4)
+                for _ in range(scroll_iterations):
                     try:
-                        await page_obj.wait_for_selector("input#searchInput", timeout=5000)
-                    except PlaywrightTimeoutError:
+                        await page_obj.mouse.wheel(0, random.randint(900, 1400))
+                    except Exception:  # noqa: BLE001
                         pass
-                    for _ in range(3):
-                        try:
-                            await page_obj.mouse.wheel(0, random.randint(900, 1400))
-                        except Exception:  # noqa: BLE001
-                            pass
-                        await page_obj.wait_for_timeout(random.randint(500, 900))
-
-                    if responses:
-                        logger.info("[WB/Playwright] JSON XHR найден: %s", len(responses))
-                        collected: list[int] = []
-                        for payload in responses:
-                            for product in payload.get("data", {}).get("products", []):
-                                if isinstance(product, Mapping) and product.get("id") is not None:
-                                    try:
-                                        collected.append(int(product.get("id")))
-                                    except (TypeError, ValueError):
-                                        continue
-                        if collected:
-                            ids_from_xhr = list(dict.fromkeys(collected))
-                            nm_ids = list(ids_from_xhr)
-                            source = "html_xhr"
-
-                    if not nm_ids:
-                        try:
-                            hrefs = await page_obj.eval_on_selector_all(
-                                'a[href*="/catalog/"][href$="/detail.aspx"]',
-                                "els => els.slice(0,60).map(a => a.href)",
-                            )
-                        except Exception:  # noqa: BLE001
-                            hrefs = []
-                        logger.info(
-                            "[WB/Playwright] DOM карточек: %s, XHR карточек: %s",
-                            len(hrefs or []),
-                            len(responses),
+                    await page_obj.wait_for_timeout(
+                        random.randint(
+                            max(500, int(throttle_base * 0.6)),
+                            max(900, int(throttle_base)),
                         )
-                        dom_collected: list[int] = []
-                        for href in hrefs or []:
-                            match = re.search(r"/catalog/(\d+)/detail\.aspx", href or "")
-                            if match:
-                                dom_collected.append(int(match.group(1)))
-                        if dom_collected:
-                            ids_from_dom = list(dict.fromkeys(dom_collected))
-                            nm_ids = list(ids_from_dom)
-                            source = "html_dom"
-                            logger.info(
-                                "[WB/Playwright] HTML DOM fallback recovered %d ids",
-                                len(ids_from_dom),
-                            )
+                    )
 
-                    ids_found_count = (
-                        len(nm_ids)
-                        or len(ids_from_xhr)
-                        or len(ids_from_dom)
-                    )
-                    logger.info(
-                        "[WB/Playwright] page diagnostics: proxy=%s anti_bot=%s len_html=%s ids_found=%s",
-                        proxy_for_log or "-",
-                        False,
-                        last_html_length,
-                        ids_found_count,
-                    )
+                if responses:
+                    logger.info("[WB/Playwright] JSON XHR найден: %s", len(responses))
+                    collected: list[int] = []
+                    for payload in responses:
+                        for product in payload.get("data", {}).get("products", []):
+                            if isinstance(product, Mapping) and product.get("id") is not None:
+                                try:
+                                    collected.append(int(product.get("id")))
+                                except (TypeError, ValueError):
+                                    continue
+                    if collected:
+                        ids_from_xhr = list(dict.fromkeys(collected))
+                        nm_ids = list(ids_from_xhr)
+                        source = "html_xhr"
+
+                if not nm_ids:
+                    try:
+                        ids_from_dom = await collect_dom_ids(page_obj)
+                    except Exception:  # noqa: BLE001
+                        ids_from_dom = []
+                    if ids_from_dom:
+                        nm_ids = list(ids_from_dom)
+                        source = "html_dom"
+                        html_block_detected = False
+                        logger.info(
+                            "[WB/Playwright] HTML DOM fallback recovered %d ids",
+                            len(ids_from_dom),
+                        )
+
+                ids_found_count = (
+                    len(nm_ids)
+                    or len(ids_from_xhr)
+                    or len(ids_from_dom)
+                )
+                logger.info(
+                    "[WB/Playwright] page diagnostics: proxy=%s anti_bot=%s html_status=%s len_html=%s ids_found=%s source=%s",
+                    proxy_for_log or "-",
+                    html_block_detected,
+                    last_status,
+                    last_html_length,
+                    ids_found_count,
+                    source,
+                )
+                last_html_anti_bot = html_block_detected
 
                 if not nm_ids and not html_block_detected:
                     html_block_detected = True
@@ -1868,31 +1949,43 @@ class WildberriesClient:
         ids_found = len(ids_from_xhr) if ids_from_xhr else len(ids_from_dom)
         if not ids_found:
             ids_found = len(nm_ids)
-        detail_chunks = detail_meta.get("chunks")
+        detail_batches = detail_meta.get("detail_batches", detail_meta.get("chunks"))
+        if detail_batches is None:
+            detail_batches = 0
+        detail_chunks = detail_batches
         detail_singles = detail_meta.get("singles")
-        detail_retries = detail_meta.get("retries")
-        detail_rotations = detail_meta.get("rotations")
+        detail_retries = detail_meta.get("detail_retries", detail_meta.get("retries"))
+        detail_rotations = detail_meta.get("detail_rotations", detail_meta.get("rotations"))
         detail_time = detail_meta.get("duration_ms")
         detail_dom_only = bool(detail_meta.get("dom_only"))
         detail_final_chunk = detail_meta.get("final_chunk")
+        detail_used_v4 = bool(detail_meta.get("detail_used_v4"))
+        detail_enriched_total = detail_meta.get("detail_enriched_total")
+        if detail_enriched_total is None:
+            detail_enriched_total = len(detail_map)
 
+        proxy_rotated_flag = bool(self._proxy_rotated_flag)
         logger.info(
-            "source=%s page=%s status=%s ids=%s enriched=%s slow=%s proxy=%s timing=%dms anti_bot=%s len_html=%s ids_found=%s detail_chunks=%s detail_singles=%s detail_retries=%s detail_rotations=%s",
+            "source=%s page=%s status=%s html_status=%s ids=%s enriched=%s slow=%s proxy=%s proxy_rotated=%s timing=%dms anti=%s len_html=%s ids_found=%s detail_batches=%s detail_singles=%s detail_retries=%s detail_rotations=%s detail_used_v4=%s detail_enriched=%s",
             "html_dom_no_detail" if detail_dom_only else source,
             page,
             "ok_dom_only" if detail_dom_only else "ok",
+            last_status,
             len(nm_ids),
             enriched_count,
             self._slow_mode_active or slow_mode_used,
             proxy_for_meta or "-",
+            int(proxy_rotated_flag),
             int(timing_ms),
             last_html_anti_bot,
             last_html_length,
             ids_found,
-            detail_chunks,
+            detail_batches,
             detail_singles,
             detail_retries,
             detail_rotations,
+            int(detail_used_v4),
+            detail_enriched_total,
         )
 
         return PageFetchMeta(
@@ -1910,7 +2003,8 @@ class WildberriesClient:
             html_enriched=enriched_count,
             slow_mode=self._slow_mode_active or slow_mode_used,
             proxy=proxy_for_meta,
-            proxy_rotated=bool(self._proxy_rotated_flag),
+            proxy_rotated=proxy_rotated_flag,
+            html_status=last_status,
             detail_chunks=detail_chunks,
             detail_singles=detail_singles,
             detail_retries=detail_retries,
@@ -1918,6 +2012,9 @@ class WildberriesClient:
             detail_time_ms=detail_time,
             detail_dom_only=detail_dom_only,
             detail_final_chunk=detail_final_chunk,
+            detail_batches=detail_batches,
+            detail_enriched_total=detail_enriched_total,
+            detail_used_v4=detail_used_v4,
         )
     async def _request_with_backoff(
         self,
@@ -2048,12 +2145,16 @@ class WildberriesClient:
         if not missing_ids:
             return
 
-        detail_map = await self._fetch_details(
+        detail_result = await self._fetch_details(
             missing_ids,
             timeout=timeout,
             headers=headers,
             client=client,
         )
+        if isinstance(detail_result, tuple):
+            detail_map, _ = detail_result
+        else:
+            detail_map = detail_result
         for item in items:
             product_id = item.get("id")
             if product_id is None:
@@ -2156,6 +2257,9 @@ class WildberriesClient:
             "duration_ms": 0.0,
             "final_chunk": max_chunk,
             "dom_only": False,
+            "detail_batches": 0,
+            "detail_enriched_total": 0,
+            "used_v4_fallback": False,
         }
         start_time = time.monotonic()
 
@@ -2237,7 +2341,7 @@ class WildberriesClient:
                     or "-"
                 )
                 logger.info(
-                    "detail_chunk variant=%s n=%s status=%s len=%s products=%s proxy=%s rotated=%s retries=%s size=%s dest=%s spp=%s",
+                    "detail_chunk via=httpx variant=%s n=%s status=%s len=%s products=%s proxy=%s rotated=%s retries=%s size=%s dest=%s spp=%s",
                     "v2",
                     len(ids),
                     status if status is not None else "-",
@@ -2254,6 +2358,7 @@ class WildberriesClient:
                     should_retry = True
                     rotate_reason = f"detail_status_{status or 'error'}"
                 if status == 200 and not products and DETAIL_USE_V4_FALLBACK:
+                    meta["used_v4_fallback"] = True
                     status_v4, products, body_len_v4 = await _detail_request(
                         DETAIL_API_URL_V4,
                         ids,
@@ -2268,7 +2373,7 @@ class WildberriesClient:
                         or "-"
                     )
                     logger.info(
-                        "detail_chunk variant=%s n=%s status=%s len=%s products=%s proxy=%s rotated=%s retries=%s size=%s dest=%s spp=%s",
+                        "detail_chunk via=httpx variant=%s n=%s status=%s len=%s products=%s proxy=%s rotated=%s retries=%s size=%s dest=%s spp=%s",
                         "v4",
                         len(ids),
                         status if status is not None else "-",
@@ -2308,7 +2413,7 @@ class WildberriesClient:
                         or "-"
                     )
                     logger.info(
-                        "detail_chunk variant=%s n=%s status=%s len=%s products=%s proxy=%s rotated=%s retries=%s size=%s dest=%s spp=%s",
+                        "detail_chunk via=httpx variant=%s n=%s status=%s len=%s products=%s proxy=%s rotated=%s retries=%s size=%s dest=%s spp=%s",
                         rotate_reason,
                         len(ids),
                         status if status is not None else "-",
@@ -2363,6 +2468,12 @@ class WildberriesClient:
             logger.warning(
                 "[WB/detail] DOM-only fallback для %s товаров", len(failed_ids)
             )
+
+        meta["detail_batches"] = meta.get("chunks", 0)
+        meta["detail_enriched_total"] = len(products_map)
+        meta["detail_used_v4"] = bool(meta.get("used_v4_fallback"))
+        meta.setdefault("detail_retries", meta.get("retries"))
+        meta.setdefault("detail_rotations", meta.get("rotations"))
 
         return products_map, meta
 

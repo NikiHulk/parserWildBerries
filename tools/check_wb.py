@@ -75,21 +75,26 @@ async def _run(args: argparse.Namespace) -> None:
         extra_parts: list[str] = []
         if html_ids is not None:
             extra_parts.append(f"ids={html_ids} enriched={html_enriched}")
-        detail_chunks = summary.get("detail_chunks")
+        detail_batches = summary.get("detail_batches") or summary.get("detail_chunks")
         detail_singles = summary.get("detail_singles")
         detail_retries = summary.get("detail_retries")
         detail_rotations = summary.get("detail_rotations")
         detail_time_ms = summary.get("detail_time_ms")
         detail_final_chunk = summary.get("detail_final_chunk")
+        detail_enriched_total = summary.get("detail_enriched_total")
+        detail_used_v4 = summary.get("detail_used_v4")
         if (
-            detail_chunks is not None
+            detail_batches is not None
             or detail_singles is not None
             or detail_retries is not None
             or detail_final_chunk is not None
+            or detail_time_ms is not None
+            or detail_enriched_total is not None
+            or detail_used_v4
         ):
             detail_parts = []
-            if detail_chunks is not None:
-                detail_parts.append(f"chunks={detail_chunks}")
+            if detail_batches is not None:
+                detail_parts.append(f"batches={detail_batches}")
             if detail_singles is not None:
                 detail_parts.append(f"singles={detail_singles}")
             if detail_retries is not None:
@@ -100,17 +105,23 @@ async def _run(args: argparse.Namespace) -> None:
                 detail_parts.append(f"time={int(detail_time_ms)}ms")
             if detail_final_chunk is not None:
                 detail_parts.append(f"final_chunk={detail_final_chunk}")
+            if detail_enriched_total is not None:
+                detail_parts.append(f"enriched={detail_enriched_total}")
+            if detail_used_v4:
+                detail_parts.append("used_v4=1")
             extra_parts.append("detail:" + " ".join(detail_parts))
         if summary.get("detail_dom_only"):
             extra_parts.append("detail_dom_only=1")
         extra = f" {' '.join(extra_parts)}" if extra_parts else ""
+        html_status = summary.get("html_status")
         print(
-            "source={source} page={page} status={status} products={products} "
+            "source={source} page={page} status={status} html_status={html_status} products={products} "
             "limit={limit} dest={dest} spp={spp} cache={cache} slow={slow} "
             "timing={timing:.0f}ms{extra} proxy={proxy}{proxy_rotated}".format(
                 page=summary.get("page"),
                 source=summary.get("source"),
                 status=summary.get("status"),
+                html_status=html_status,
                 products=summary.get("products"),
                 limit=summary.get("limit"),
                 dest=summary.get("dest"),
