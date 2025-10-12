@@ -43,10 +43,11 @@ PLAYWRIGHT_STATE_PATH=/app/data/wb_playwright_state.json
 PLAYWRIGHT_USER_DATA_DIR=data
 PLAYWRIGHT_PROXY=
 PROXY_POOL=
-PROXY_STICKY_PAGES=10
 HTTPX_PROXY=
 WB_HTTP_PROXY=
 HTTP_PROXY=
+# при необходимости можно задать HTTPS_PROXY/ALL_PROXY
+HTTPS_PROXY=
 # Параметры YooKassa и подписок можно оставить пустыми, если они не нужны.
 YOOKASSA_SHOP_ID=
 YOOKASSA_SECRET_KEY=
@@ -77,9 +78,8 @@ python -m bot.main
 - `PLAYWRIGHT_STATE_PATH` — файл `storage_state`, где сохраняются cookies/локальные данные (по умолчанию `/app/data/wb_playwright_state.json`).
 - `PLAYWRIGHT_USER_DATA_DIR` — директория для вспомогательных данных Playwright (`data` по умолчанию).
 - `PLAYWRIGHT_PROXY` — фиксированный прокси только для Playwright. Если не указан, клиент будет чередовать значения из `PROXY_POOL`.
-- `PROXY_POOL` — список прокси через запятую (`http://user:pass@ip:port`). Рекомендуются residential/ISP RU-прокси, липкие 10–30 минут.
-- `PROXY_STICKY_PAGES` — сколько страниц отдавать одному прокси перед ротацией (по умолчанию 10).
-- `HTTPX_PROXY` / `WB_HTTP_PROXY` / `HTTP_PROXY` — прокси для HTTP-запросов (JSON API Wildberries, Telegram и т.д.). Клиент использует первое непустое значение в указанном порядке.
+- `PROXY_POOL` — список прокси через запятую (`http://user:pass@ip:port`). Прокси ротируются по кругу с липким окном 60–120 с; при 403/498/429 или таймаутах используется следующий адрес. Рекомендуются residential/ISP RU-прокси со sticky-сеансами 10–30 минут.
+- `HTTPX_PROXY` / `WB_HTTP_PROXY` / `HTTP_PROXY` — прокси для HTTP-запросов (JSON API Wildberries, Telegram и т.д.). Клиент использует первое непустое значение в указанном порядке и логирует его в отчёте (лог без логина/пароля).
 
 CLI `tools/check_wb.py` поддерживает опцию `--html-first`, чтобы сразу запускать Playwright-фолбэк (например, `python tools/check_wb.py --query "стакан" --max 40 --limit 8 --html-first --throttle 2000`). При включённом режиме выводит источник (`html_xhr`/`html_dom`), использованный прокси и факт ротации.
 
