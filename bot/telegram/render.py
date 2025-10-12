@@ -16,7 +16,10 @@ def _fmt_int(value: Optional[float]) -> str:
 
 def _sale_price(product: Dict) -> float:
     price_units = product.get("salePriceU") or product.get("priceU") or 0
-    return float(price_units) / 100.0
+    try:
+        return float(price_units) / 100.0
+    except (TypeError, ValueError):  # noqa: BLE001
+        return 0.0
 
 
 def _stock(product: Dict) -> int:
@@ -32,7 +35,10 @@ def _stock(product: Dict) -> int:
 
 def build_caption(product: Dict, target_buy_price: Optional[float] = None) -> str:
     name = product.get("name") or "Товар"
-    sale_price = _sale_price(product)
+    wallet_price = product.get("price_wb_wallet") or product.get("wallet_price")
+    if wallet_price is None:
+        wallet_price = _sale_price(product)
+    sale_price = wallet_price
     rating = product.get("rating") or 0
     feedbacks = product.get("feedbacks") or 0
     colors = product.get("colors") or []
@@ -59,11 +65,25 @@ def build_caption(product: Dict, target_buy_price: Optional[float] = None) -> st
         or "—"
     )
 
-    profit_rub = pct = None
-    if target_buy_price:
-        profit_rub = target_buy_price - sale_price
-        if target_buy_price > 0:
-            pct = profit_rub / target_buy_price * 100.0
+    if target_buy_price is None:
+        target_buy_price = (
+            product.get("best_buy_price")
+            or product.get("best_buyout_price")
+            or None
+        )
+
+    profit_rub = product.get("profit_rub")
+    pct = product.get("profit_percent")
+    if profit_rub is None or pct is None:
+        if target_buy_price:
+            profit_rub = (target_buy_price or 0) - (sale_price or 0)
+            if target_buy_price and target_buy_price > 0:
+                pct = (profit_rub / target_buy_price) * 100.0
+            else:
+                pct = None
+        else:
+            profit_rub = None
+            pct = None
 
     lines: list[str] = []
     url = product.get("url") or ""
@@ -73,9 +93,11 @@ def build_caption(product: Dict, target_buy_price: Optional[float] = None) -> st
     lines.append(f"Цена с WB кошельком: {_fmt_int(sale_price)}")
     if target_buy_price:
         lines.append(f"Лучшая цена скупки: {_fmt_int(target_buy_price)}")
-        lines.append(
-            f"Профит: {_fmt_int(profit_rub)}р или {round(pct or 0, 1)}%"
-        )
+        if profit_rub is not None:
+            pct_value = round(pct or 0, 1) if pct is not None else "—"
+            lines.append(
+                f"Профит: {_fmt_int(profit_rub)}р или {pct_value}%"
+            )
     lines.append(f"Рейтинг товара: {rating}")
     lines.append(f"Количество отзывов: {feedbacks}")
     lines.append(f"Особенности: {color}")

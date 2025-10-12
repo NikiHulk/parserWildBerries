@@ -194,6 +194,65 @@ class Product:
     score: float | None = None
 
 
+def _extract_numeric(item: Any, *names: str) -> float | int | None:
+    for name in names:
+        if isinstance(item, Mapping) and name in item:
+            value = item.get(name)
+            if value not in (None, ""):
+                return value
+        if hasattr(item, name):
+            value = getattr(item, name)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def compute_profit(item: Any) -> tuple[float, int]:
+    """Возвращает (процент, абсолютный профит) для карточки."""
+
+    buy_raw = _extract_numeric(item, "price_wb_wallet", "wallet_price", "price")
+    sell_raw = _extract_numeric(
+        item, "best_buy_price", "best_buyout_price", "best_buy_price_rub"
+    )
+
+    try:
+        buy = float(buy_raw)
+        sell = float(sell_raw)
+    except (TypeError, ValueError):  # noqa: BLE001
+        return (0.0, 0)
+
+    if buy <= 0 or sell <= 0:
+        return (0.0, 0)
+
+    abs_gain = max(0, int(round(sell - buy)))
+    pct = (abs_gain / sell) * 100.0 if sell else 0.0
+    return (pct, abs_gain)
+
+
+def score_item(item: Any) -> tuple[float, int, float, int, int]:
+    """Композитный скоринг для выбора TOP-K предложений в боте."""
+
+    pct, gain = compute_profit(item)
+    rating_raw = _extract_numeric(item, "rating", "reviewRating")
+    feedbacks_raw = _extract_numeric(item, "feedbacks", "reviews")
+    stock_raw = _extract_numeric(item, "stock", "stocks", "wh")
+
+    try:
+        rating = float(rating_raw) if rating_raw is not None else 0.0
+    except (TypeError, ValueError):  # noqa: BLE001
+        rating = 0.0
+    try:
+        feedbacks = int(feedbacks_raw) if feedbacks_raw is not None else 0
+    except (TypeError, ValueError):  # noqa: BLE001
+        feedbacks = 0
+    try:
+        stock = int(stock_raw) if stock_raw is not None else 0
+    except (TypeError, ValueError):  # noqa: BLE001
+        stock = 0
+
+    return (pct, gain, rating, feedbacks, stock)
+
+
 @dataclass(slots=True)
 class PageFetchMeta:
     products: list[dict[str, Any]]

@@ -16,15 +16,27 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
 from ..config import get_settings
-from ..services.wildberries import WildberriesClient, build_image_url
+from ..services.wildberries import WildberriesClient, build_image_url, score_item
 from .render import build_caption
-from .ui import CANCEL_BUTTON, SEARCH_BUTTON, main_kb, pager_kb, remove_kb
+from .ui import (
+    SEARCH_BUTTON,
+    cancel_kb,
+    cancel_skip_kb,
+    main_kb,
+    pager_kb,
+    remove_kb,
+)
 
 router = Router()
 
 _settings = get_settings()
 PAGE_SIZE = max(1, int(_settings.tg_results_per_page))
 WELCOME_TEXT = _settings.tg_welcome_text
+CANCEL_TEXT = _settings.tg_cancel_text
+SKIP_TEXT = _settings.tg_skip_text
+TOP_K = max(1, int(_settings.tg_top_k))
+
+_SPLIT_EXCLUDES_RE = re.compile(r"[\n,;]+")
 
 
 class SearchStates(StatesGroup):
@@ -39,7 +51,7 @@ def _is_cancel(text: str | None) -> bool:
         return False
     normalized = text.strip().lower()
     return normalized in {
-        CANCEL_BUTTON.lower(),
+        CANCEL_TEXT.lower(),
         "отмена",
         "cancel",
         "/cancel",
@@ -52,7 +64,7 @@ def _parse_price(value: str | None) -> int | None:
     normalized = value.strip()
     if not normalized:
         return None
-    if normalized.lower() in {"пропустить", "skip", "нет", "-"}:
+    if normalized.lower() in {SKIP_TEXT.lower(), "пропустить", "skip", "нет", "-"}:
         return None
     cleaned = re.sub(r"[^0-9]", "", normalized)
     if not cleaned:
@@ -63,11 +75,38 @@ def _parse_price(value: str | None) -> int | None:
     return result
 
 
-def _normalize_words(text: str | None) -> List[str]:
-    if not text:
+def parse_excludes(raw: str | None) -> List[str]:
+    """Parses exclude list safely, ignoring short/empty tokens."""
+
+    if not raw:
         return []
-    tokens = re.split(r"[\s,;\n]+", text)
-    return [token.strip().lower() for token in tokens if token.strip()]
+    items = [token.strip().lower() for token in _SPLIT_EXCLUDES_RE.split(raw)]
+    banned_symbols = {".", ",", "-", "_", "—", "–", "/", "\\"}
+    return [
+        token
+        for token in items
+        if token
+        and token not in banned_symbols
+        and len(token) > 1
+    ]
+
+
+def _product_matches_excludes(product: Any, excludes: List[str]) -> bool:
+    if not excludes:
+        return False
+
+    parts: List[str] = []
+    for attr in ("name", "brand"):
+        value = getattr(product, attr, None)
+        if isinstance(value, str):
+            parts.append(value)
+
+    features = getattr(product, "features", None)
+    if isinstance(features, list):
+        parts.extend(str(item) for item in features if item)
+
+    hay = " ".join(parts).lower()
+    return any(ex in hay for ex in excludes)
 
 
 def _product_to_payload(product: Any) -> Dict[str, Any]:
@@ -85,7 +124,16 @@ def _product_to_payload(product: Any) -> Dict[str, Any]:
     price = payload.get("price")
     if price is None:
         price = getattr(product, "price", None)
-    wallet_price = payload.get("wallet_price") or getattr(product, "wallet_price", None)
+    wallet_price = (
+        payload.get("wallet_price")
+        or getattr(product, "wallet_price", None)
+        or getattr(product, "price_wb_wallet", None)
+    )
+    best_buy_price = (
+        payload.get("best_buy_price")
+        or getattr(product, "best_buyout_price", None)
+        or getattr(product, "best_buy_price", None)
+    )
 
     sale_units = None
     if price is not None:
@@ -94,11 +142,13 @@ def _product_to_payload(product: Any) -> Dict[str, Any]:
         except (TypeError, ValueError):
             sale_units = None
     price_units = None
+    wallet_price_units = None
     if wallet_price is not None:
         try:
-            price_units = int(round(float(wallet_price) * 100))
+            wallet_price_units = int(round(float(wallet_price) * 100))
         except (TypeError, ValueError):
-            price_units = None
+            wallet_price_units = None
+    price_units = wallet_price_units
 
     features = payload.get("features") or getattr(product, "features", None) or []
     if isinstance(features, str):
@@ -131,12 +181,28 @@ def _product_to_payload(product: Any) -> Dict[str, Any]:
         payload.get("supplierRegistration") or seller_registration
     )
 
+    profit_rub = payload.get("profit_rub") or getattr(product, "profit_rub", None)
+    profit_percent = (
+        payload.get("profit_percent")
+        or getattr(product, "profit_percent", None)
+    )
+
+    stock_total = payload.get("stock")
+    if stock_total is None:
+        stock_total = getattr(product, "stock", None)
+
     return {
         "id": product_id,
         "name": name,
         "brand": brand,
         "salePriceU": sale_units,
         "priceU": price_units,
+        "wallet_price": wallet_price,
+        "price_wb_wallet": wallet_price,
+        "best_buy_price": best_buy_price,
+        "best_buyout_price": best_buy_price,
+        "profit_rub": profit_rub,
+        "profit_percent": profit_percent,
         "rating": rating,
         "feedbacks": feedbacks,
         "colors": features,
@@ -146,13 +212,14 @@ def _product_to_payload(product: Any) -> Dict[str, Any]:
             if stock is not None
             else []
         ),
-        "stock": stock,
+        "stock": stock_total,
         "supplier": supplier,
         "supplierRating": supplier_rating,
         "supplierOrders": supplier_orders,
         "supplierRegistration": supplier_registration,
         "url": url,
         "image_url": image_url,
+        "score": payload.get("score") or getattr(product, "score", None),
     }
 
 
@@ -207,7 +274,8 @@ async def _send_page(bot, chat_id: int, state: FSMContext, items: List[Dict[str,
 
     new_message_ids: List[int] = []
     for product in chunk:
-        caption = build_caption(product)
+        target_buy = product.get("best_buy_price")
+        caption = build_caption(product, target_buy_price=target_buy)
         image_url = product.get("image_url")
         if image_url:
             sent = await bot.send_photo(
@@ -282,8 +350,8 @@ async def start_flow(message: Message, state: FSMContext) -> None:
     await _clear_previous_results(message.bot, message.chat.id, state)
     await state.set_state(SearchStates.entering_query)
     await message.answer(
-        "Введите название товара (для отмены отправьте «❌ Отмена»):",
-        reply_markup=remove_kb(),
+        f"Введите название товара (для отмены — «{CANCEL_TEXT}»):",
+        reply_markup=cancel_kb(CANCEL_TEXT),
     )
 
 
@@ -297,17 +365,17 @@ async def handle_query(message: Message, state: FSMContext) -> None:
     if not text:
         await message.answer(
             "Название не может быть пустым. Попробуйте ещё раз.",
-            reply_markup=remove_kb(),
+            reply_markup=cancel_kb(CANCEL_TEXT),
         )
         return
     await state.update_data(query=text)
     await state.set_state(SearchStates.entering_max_price)
     await message.answer(
         (
-            "Верхний порог цены (рубли). Оставьте пустым или отправьте «пропустить»,"
-            " если ограничение не нужно. Для отмены — «❌ Отмена»."
+            "Верхний порог цены (рубли). Можно пропустить, отправив пустое сообщение"
+            f" или кнопку «{SKIP_TEXT}». Для отмены — «{CANCEL_TEXT}»."
         ),
-        reply_markup=remove_kb(),
+        reply_markup=cancel_kb(CANCEL_TEXT),
     )
 
 
@@ -326,7 +394,7 @@ async def handle_max_price(message: Message, state: FSMContext) -> None:
         except ValueError:
             await message.answer(
                 "Не удалось распознать цену. Введите целое число или оставьте поле пустым.",
-                reply_markup=remove_kb(),
+                reply_markup=cancel_kb(CANCEL_TEXT),
             )
             return
     await state.update_data(max_price=price)
@@ -334,22 +402,27 @@ async def handle_max_price(message: Message, state: FSMContext) -> None:
     await message.answer(
         (
             "Исключающие слова (через запятую). Например: б/у, восстановленный."
-            " Можно отправить пустое сообщение. Для отмены — «❌ Отмена»."
+            f" Можно пропустить через кнопку «{SKIP_TEXT}». Для отмены — «{CANCEL_TEXT}»."
         ),
-        reply_markup=remove_kb(),
+        reply_markup=cancel_skip_kb(CANCEL_TEXT, SKIP_TEXT),
     )
 
 
 @router.message(SearchStates.entering_excludes)
 async def handle_excludes(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
+    lowered = text.lower()
     if _is_cancel(text):
         await _clear_previous_results(message.bot, message.chat.id, state)
         await state.clear()
         await message.answer(WELCOME_TEXT, reply_markup=main_kb())
         return
 
-    banned_words = _normalize_words(text)
+    skip_tokens = {SKIP_TEXT.lower(), "пропустить", "skip", "-", "нет"}
+    if not text or lowered in skip_tokens:
+        banned_words: List[str] = []
+    else:
+        banned_words = parse_excludes(text)
     data = await state.get_data()
     query = data.get("query")
     max_price = data.get("max_price")
@@ -364,7 +437,7 @@ async def handle_excludes(message: Message, state: FSMContext) -> None:
 
     progress_message = await message.answer(
         "Ищу подходящие товары...",
-        reply_markup=main_kb(),
+        reply_markup=remove_kb(),
     )
 
     try:
@@ -391,20 +464,21 @@ async def handle_excludes(message: Message, state: FSMContext) -> None:
         )
         return
 
-    items = [_product_to_payload(product) for product in products]
-
-    filtered_items: List[Dict[str, Any]] = []
-    for item in items:
+    filtered_products: List[Any] = []
+    for product in products:
         if max_price is not None:
-            price_units = item.get("salePriceU") or item.get("priceU") or 0
-            if price_units and (price_units / 100.0) > float(max_price):
+            limit_value = float(max_price)
+            price_value = (
+                getattr(product, "wallet_price", None)
+                or getattr(product, "price", None)
+            )
+            if price_value is not None and price_value > limit_value:
                 continue
-        haystack = f"{item.get('name', '')} {item.get('brand', '')}".lower()
-        if any(word in haystack for word in banned_words):
+        if _product_matches_excludes(product, banned_words):
             continue
-        filtered_items.append(item)
+        filtered_products.append(product)
 
-    if not filtered_items:
+    if not filtered_products:
         if progress_message:
             try:
                 await message.bot.delete_message(
@@ -419,12 +493,13 @@ async def handle_excludes(message: Message, state: FSMContext) -> None:
         )
         return
 
-    filtered_items.sort(
-        key=lambda item: item.get("salePriceU") or item.get("priceU") or 0,
-    )
+    ranked_products = sorted(filtered_products, key=score_item, reverse=True)
+    best_products = ranked_products[:TOP_K]
+
+    items = [_product_to_payload(product) for product in best_products]
 
     await state.update_data(
-        results=filtered_items,
+        results=items,
         page=0,
         product_message_ids=[],
         nav_message_id=None,
@@ -435,7 +510,7 @@ async def handle_excludes(message: Message, state: FSMContext) -> None:
         bot=message.bot,
         chat_id=message.chat.id,
         state=state,
-        items=filtered_items,
+        items=items,
         page=0,
     )
 
@@ -471,7 +546,7 @@ async def handle_pagination(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-@router.message(SearchStates.showing_results, F.text == CANCEL_BUTTON)
+@router.message(SearchStates.showing_results, F.text.casefold() == CANCEL_TEXT.lower())
 async def handle_cancel_in_results(message: Message, state: FSMContext) -> None:
     await _clear_previous_results(message.bot, message.chat.id, state)
     await state.clear()

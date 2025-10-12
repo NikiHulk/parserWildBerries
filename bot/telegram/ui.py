@@ -10,10 +10,14 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
+from ..config import get_settings
+
+_settings = get_settings()
+
 SEARCH_BUTTON = "🔎 Поиск"
 SETTINGS_BUTTON = "⚙️ Настройки"
 HELP_BUTTON = "ℹ️ Помощь"
-CANCEL_BUTTON = "❌ Отмена"
+CANCEL_BUTTON = _settings.tg_cancel_text
 
 
 def main_kb() -> ReplyKeyboardMarkup:
@@ -33,14 +37,23 @@ def main_kb() -> ReplyKeyboardMarkup:
     )
 
 
-def cancel_kb() -> ReplyKeyboardMarkup:
-    """Standalone cancel keyboard (legacy scenarios)."""
+def cancel_kb(text: str) -> ReplyKeyboardMarkup:
+    """Single cancel button keyboard used during input steps."""
 
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=CANCEL_BUTTON)]],
+        keyboard=[[KeyboardButton(text=text)]],
         resize_keyboard=True,
         one_time_keyboard=False,
-        input_field_placeholder="Отправьте текст или отмените",
+    )
+
+
+def cancel_skip_kb(cancel_text: str, skip_text: str) -> ReplyKeyboardMarkup:
+    """Cancel/skip keyboard for optional steps."""
+
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=cancel_text), KeyboardButton(text=skip_text)]],
+        resize_keyboard=True,
+        one_time_keyboard=False,
     )
 
 
@@ -51,6 +64,8 @@ def remove_kb() -> ReplyKeyboardRemove:
 
 
 def pager_kb(page: int, total_pages: int) -> InlineKeyboardMarkup:
+    """Inline keyboard for navigating result pages."""
+
     left_page = max(0, page - 1)
     right_page = min(total_pages - 1, page + 1)
     keyboard = InlineKeyboardMarkup()
