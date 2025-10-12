@@ -54,9 +54,36 @@ HTML_SETTLE_MS = int(os.getenv("PLAYWRIGHT_THROTTLE_MS", "800") or "800")
 START_LIMIT = 20
 MAX_CATALOG_ATTEMPTS = 2
 PAGE_DELAY_RANGE = (0.30, 0.70)
-DETAIL_BATCH = 30
-DETAIL_MAX_ATTEMPTS = 3
 MAX_HTML_IDS = 120
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        value = os.getenv(name)
+        if value is None or value.strip() == "":
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning("Некорректное значение %s=%r, используется %s", name, os.getenv(name), default)
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+DETAIL_MAX_CHUNK = max(1, _env_int("WB_DETAIL_MAX_CHUNK", 10))
+DETAIL_MIN_CHUNK = max(1, _env_int("WB_DETAIL_MIN_CHUNK", 1))
+if DETAIL_MIN_CHUNK > DETAIL_MAX_CHUNK:
+    DETAIL_MIN_CHUNK = DETAIL_MAX_CHUNK
+DETAIL_MAX_RETRIES = max(1, _env_int("WB_DETAIL_MAX_RETRIES", 3))
+DETAIL_JITTER_MIN = max(0.0, _env_int("WB_DETAIL_JITTER_MIN_MS", 200) / 1000)
+DETAIL_JITTER_MAX = max(DETAIL_JITTER_MIN, _env_int("WB_DETAIL_JITTER_MAX_MS", 800) / 1000)
+DETAIL_ROTATE_ON_EMPTY = _env_bool("WB_DETAIL_ROTATE_ON_EMPTY", True)
+DETAIL_USE_V4_FALLBACK = _env_bool("WB_DETAIL_USE_V4_FALLBACK", True)
 
 from bot.utils.proxy import (
     ProxyRotator,
@@ -184,6 +211,13 @@ class PageFetchMeta:
     slow_mode: bool = False
     proxy: str | None = None
     proxy_rotated: bool = False
+    detail_chunks: int | None = None
+    detail_singles: int | None = None
+    detail_retries: int | None = None
+    detail_rotations: int | None = None
+    detail_time_ms: float | None = None
+    detail_dom_only: bool | None = None
+    detail_final_chunk: int | None = None
 
 
 class WildberriesClient:
@@ -280,6 +314,9 @@ class WildberriesClient:
         self._request_context: "APIRequestContext" | None = None
         self._request_context_proxy: str | None = None
         self._request_context_lock = asyncio.Lock()
+        self._detail_transport: httpx.HTTPTransport | None = None
+        self._detail_client: httpx.Client | None = None
+        self._detail_proxy_key: str | None = None
 
     @staticmethod
     def _detect_http2_support() -> bool:
@@ -346,6 +383,55 @@ class WildberriesClient:
             self._http_client_needs_restart = False
         return self._http_client
 
+    def _close_detail_client(self) -> None:
+        client = self._detail_client
+        if client is not None:
+            try:
+                client.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[WB/detail] Ошибка закрытия клиента: %s", exc)
+        transport = self._detail_transport
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[WB/detail] Ошибка закрытия транспорта: %s", exc)
+        self._detail_client = None
+        self._detail_transport = None
+        self._detail_proxy_key = None
+
+    def _ensure_detail_client(self) -> httpx.Client:
+        proxy_raw = self._proxy_rotator.current() or self._current_http_proxy_raw()
+        if proxy_raw != self._detail_proxy_key or self._detail_client is None:
+            self._close_detail_client()
+            transport = httpx.HTTPTransport(
+                proxy=proxy_raw,
+                verify=False,
+                http2=False,
+            )
+            headers = {
+                "User-Agent": self._headers.get("User-Agent", DEFAULT_DESKTOP_UA),
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Origin": "https://www.wildberries.ru",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Dest": "empty",
+            }
+            self._detail_transport = transport
+            self._detail_client = httpx.Client(
+                transport=transport,
+                timeout=self._timeout,
+                follow_redirects=False,
+                headers=headers,
+            )
+            self._detail_proxy_key = proxy_raw
+            logger.info(
+                "[WB/detail] Создан httpx-клиент proxy=%s",
+                sanitize_proxy(proxy_raw) or "-",
+            )
+        return self._detail_client
+
     def _rotate_proxy(self, reason: str, *, slow_next: bool = False) -> None:
         prev = self._proxy_rotator.current()
         new_proxy = self._proxy_rotator.next(reason)
@@ -355,6 +441,7 @@ class WildberriesClient:
             self._proxy_rotated_flag = 0
         self._proxy_current = new_proxy or self._httpx_proxy_env
         self._set_active_proxy(self._proxy_current)
+        self._close_detail_client()
         self._schedule_request_context_reset()
         if slow_next:
             self._slow_mode_active = True
@@ -646,11 +733,23 @@ class WildberriesClient:
         )
 
         limited_candidates = filtered_candidates[:max_results]
-        detail_map = await self._fetch_details(
-            (int(candidate["item"]["id"]) for candidate in limited_candidates),
+        ids_for_detail: list[int] = []
+        for candidate in limited_candidates:
+            try:
+                ids_for_detail.append(int(candidate["item"]["id"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        referer_url = url_html_search(query, 1)
+        detail_map, detail_meta = await self._fetch_details(
+            ids_for_detail,
             timeout=effective_timeout,
             headers=session_headers,
+            referer=referer_url,
         )
+        if ids_for_detail and detail_meta.get("dom_only"):
+            logger.warning(
+                "[WB/detail] Адаптивный detail вернул DOM-only для %s товаров", len(ids_for_detail)
+            )
 
         products: List[Product] = []
         for candidate in limited_candidates:
@@ -1142,6 +1241,13 @@ class WildberriesClient:
             "slow": bool(page_meta.slow_mode),
             "proxy": page_meta.proxy or sanitize_proxy(self._proxy_current),
             "proxy_rotated": page_meta.proxy_rotated or self._proxy_rotated_flag,
+            "detail_chunks": page_meta.detail_chunks,
+            "detail_singles": page_meta.detail_singles,
+            "detail_retries": page_meta.detail_retries,
+            "detail_rotations": page_meta.detail_rotations,
+            "detail_time_ms": page_meta.detail_time_ms,
+            "detail_dom_only": page_meta.detail_dom_only,
+            "detail_final_chunk": page_meta.detail_final_chunk,
         }
         self._last_page_logs.append(summary)
         proxy_used = summary["proxy"]
@@ -1154,6 +1260,20 @@ class WildberriesClient:
                 extra_parts.append(f"ids={page_meta.html_ids}")
             if page_meta.html_enriched is not None:
                 extra_parts.append(f"enriched={page_meta.html_enriched}")
+        if page_meta.detail_chunks is not None:
+            extra_parts.append(f"detail_chunks={page_meta.detail_chunks}")
+        if page_meta.detail_singles is not None:
+            extra_parts.append(f"detail_singles={page_meta.detail_singles}")
+        if page_meta.detail_retries is not None:
+            extra_parts.append(f"detail_retries={page_meta.detail_retries}")
+        if page_meta.detail_rotations:
+            extra_parts.append(f"detail_rotations={page_meta.detail_rotations}")
+        if page_meta.detail_dom_only:
+            extra_parts.append("detail_dom_only=1")
+        if page_meta.detail_time_ms is not None:
+            extra_parts.append(f"detail_time={int(page_meta.detail_time_ms)}ms")
+        if page_meta.detail_final_chunk is not None:
+            extra_parts.append(f"detail_final_chunk={page_meta.detail_final_chunk}")
         if proxy_used:
             extra_parts.append(f"proxy={proxy_used}")
         if proxy_rotated:
@@ -1713,11 +1833,12 @@ class WildberriesClient:
                 proxy_rotated=bool(self._proxy_rotated_flag),
             )
 
-        detail_map = await self._fetch_details(
+        detail_map, detail_meta = await self._fetch_details(
             nm_ids,
             timeout=timeout,
             headers=headers,
             client=client,
+            referer=html_url,
         )
 
         enriched: list[dict[str, Any]] = []
@@ -1747,10 +1868,19 @@ class WildberriesClient:
         ids_found = len(ids_from_xhr) if ids_from_xhr else len(ids_from_dom)
         if not ids_found:
             ids_found = len(nm_ids)
+        detail_chunks = detail_meta.get("chunks")
+        detail_singles = detail_meta.get("singles")
+        detail_retries = detail_meta.get("retries")
+        detail_rotations = detail_meta.get("rotations")
+        detail_time = detail_meta.get("duration_ms")
+        detail_dom_only = bool(detail_meta.get("dom_only"))
+        detail_final_chunk = detail_meta.get("final_chunk")
+
         logger.info(
-            "source=%s page=%s status=ok ids=%s enriched=%s slow=%s proxy=%s timing=%dms anti_bot=%s len_html=%s ids_found=%s",
-            source,
+            "source=%s page=%s status=%s ids=%s enriched=%s slow=%s proxy=%s timing=%dms anti_bot=%s len_html=%s ids_found=%s detail_chunks=%s detail_singles=%s detail_retries=%s detail_rotations=%s",
+            "html_dom_no_detail" if detail_dom_only else source,
             page,
+            "ok_dom_only" if detail_dom_only else "ok",
             len(nm_ids),
             enriched_count,
             self._slow_mode_active or slow_mode_used,
@@ -1759,15 +1889,19 @@ class WildberriesClient:
             last_html_anti_bot,
             last_html_length,
             ids_found,
+            detail_chunks,
+            detail_singles,
+            detail_retries,
+            detail_rotations,
         )
 
         return PageFetchMeta(
             products=enriched,
-            source=source,
+            source="html_dom_no_detail" if detail_dom_only else source,
             url=html_url,
             dest=None,
             spp=None,
-            status="ok",
+            status="ok_dom_only" if detail_dom_only else "ok",
             cache="miss",
             had_429=encountered_429,
             limit=limit,
@@ -1777,6 +1911,13 @@ class WildberriesClient:
             slow_mode=self._slow_mode_active or slow_mode_used,
             proxy=proxy_for_meta,
             proxy_rotated=bool(self._proxy_rotated_flag),
+            detail_chunks=detail_chunks,
+            detail_singles=detail_singles,
+            detail_retries=detail_retries,
+            detail_rotations=detail_rotations,
+            detail_time_ms=detail_time,
+            detail_dom_only=detail_dom_only,
+            detail_final_chunk=detail_final_chunk,
         )
     async def _request_with_backoff(
         self,
@@ -1954,121 +2095,276 @@ class WildberriesClient:
         *,
         timeout: float,
         headers: Mapping[str, str] | None = None,
-        client: httpx.AsyncClient | None = None,  # сохраняем параметр для совместимости
-    ) -> Mapping[int, dict[str, Any]]:
-        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        client: httpx.AsyncClient | None = None,
+        referer: str | None = None,
+        dest: int | None = None,
+        spp: int | None = None,
+    ) -> tuple[Mapping[int, dict[str, Any]], dict[str, Any]]:
+        """Запрашивает подробности карточек через detail API с адаптивным дроблением."""
 
-        _ = headers, client  # параметры сохраняем для совместимости с сигнатурой
+        _ = headers, client, timeout  # параметры сохраняем для совместимости
 
-        id_strings = [str(pid) for pid in product_ids]
-        if not id_strings:
-            return {}
+        nm_ids: list[int] = []
+        for pid in product_ids:
+            try:
+                nm_ids.append(int(pid))
+            except (TypeError, ValueError):
+                continue
 
-        dest = self._cookie_int("dest", "x-dest", "x-dest-id") or -1257786
-        spp = self._cookie_int("spp", "x-spp") or 0
+        # убираем дубликаты, сохраняя порядок
+        seen: set[int] = set()
+        unique_ids: list[int] = []
+        for nm in nm_ids:
+            if nm not in seen:
+                seen.add(nm)
+                unique_ids.append(nm)
 
-        aggregated: dict[int, dict[str, Any]] = {}
-        proxy_for_log = sanitize_proxy(self._proxy_current or self._httpx_proxy_env)
-        timeout_ms = max(int(timeout * 1000), 5000)
+        if not unique_ids:
+            return {}, {
+                "chunks": 0,
+                "singles": 0,
+                "retries": 0,
+                "rotations": 0,
+                "duration_ms": 0.0,
+                "final_chunk": 0,
+                "dom_only": False,
+            }
 
-        async def fetch_variant(
-            ctx: "APIRequestContext",
+        dest_value = (
+            dest
+            if dest is not None
+            else self._cookie_int("dest", "x-dest", "x-dest-id")
+            or -1257786
+        )
+        spp_value = (
+            spp if spp is not None else self._cookie_int("spp", "x-spp") or 0
+        )
+        referer_url = referer or "https://www.wildberries.ru/"
+
+        max_chunk = min(DETAIL_MAX_CHUNK, len(unique_ids))
+        min_chunk = min(DETAIL_MIN_CHUNK, max_chunk)
+        jitter_min, jitter_max = DETAIL_JITTER_MIN, DETAIL_JITTER_MAX
+
+        loop = asyncio.get_running_loop()
+        products_map: dict[int, dict[str, Any]] = {}
+        failed_ids: set[int] = set()
+        meta = {
+            "chunks": 0,
+            "singles": 0,
+            "retries": 0,
+            "rotations": 0,
+            "duration_ms": 0.0,
+            "final_chunk": max_chunk,
+            "dom_only": False,
+        }
+        start_time = time.monotonic()
+
+        async def _detail_request(
             url: str,
-            batch: list[str],
-            variant: str,
-        ) -> dict[str, Any] | None:
+            batch: list[int],
+            label: str,
+        ) -> tuple[int | None, list[dict[str, Any]], int]:
+            client_sync = self._ensure_detail_client()
             params = {
                 "appType": 1,
                 "curr": "rub",
-                "dest": dest,
-                "spp": spp,
-                "nm": ",".join(batch),
+                "dest": dest_value,
+                "spp": spp_value,
+                "nm": ",".join(str(item) for item in batch),
             }
-            response = await ctx.get(url, params=params, timeout=timeout_ms)
-            status = response.status
-            logger.info(
-                "[WB/detail] via=request_context variant=%s status=%s ids=%s proxy=%s",
-                variant,
-                status,
-                len(batch),
-                proxy_for_log or "-",
-            )
-            if status != 200:
-                await response.dispose()
-                raise RuntimeError(f"status_{status}")
-
+            headers_local = {"Referer": referer_url}
             try:
-                payload = await response.json()
-            except Exception as exc:  # noqa: BLE001
-                await response.dispose()
-                logger.warning(
-                    "[WB/detail] JSON error variant=%s ids=%s: %s", variant, len(batch), exc
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: client_sync.get(
+                        url,
+                        params=params,
+                        headers=headers_local,
+                    ),
                 )
-                if variant == "v2":
-                    return None
-                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[WB/detail] request error variant=%s ids=%s: %s", label, len(batch), exc
+                )
+                return None, [], 0
 
-            await response.dispose()
-            return payload
-
-        for start in range(0, len(id_strings), DETAIL_BATCH):
-            batch = id_strings[start : start + DETAIL_BATCH]
-            attempts = 0
-            while attempts < DETAIL_MAX_ATTEMPTS:
-                attempts += 1
-                proxy_for_log = sanitize_proxy(self._proxy_current or self._httpx_proxy_env)
+            text = response.text or ""
+            status_code = response.status_code
+            response.close()
+            body_len = len(text)
+            products: list[dict[str, Any]] = []
+            if status_code == 200 and text:
                 try:
-                    ctx = await self._get_request_context()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("[WB/detail] Не удалось подготовить request context: %s", exc)
-                    await asyncio.sleep(min(0.4 * attempts, 1.2))
-                    continue
-
-                try:
-                    payload = await fetch_variant(ctx, DETAIL_API_URL_V2, batch, "v2")
-                    if payload is None:
-                        payload = await fetch_variant(ctx, DETAIL_API_URL_V4, batch, "v4")
-                except PlaywrightTimeoutError as exc:
+                    payload = json.loads(text)
+                except json.JSONDecodeError as exc:
                     logger.warning(
-                        "[WB/detail] timeout variant=v2 ids=%s proxy=%s: %s",
+                        "[WB/detail] JSON decode error variant=%s ids=%s: %s",
+                        label,
                         len(batch),
-                        proxy_for_log or "-",
                         exc,
                     )
-                    self._rotate_proxy("detail_timeout", slow_next=True)
-                    await asyncio.sleep(min(0.4 * attempts, 1.2))
-                    continue
-                except RuntimeError as exc:
-                    status_reason = str(exc)
-                    self._rotate_proxy(f"detail_{status_reason}", slow_next=True)
-                    await asyncio.sleep(min(0.4 * attempts, 1.2))
-                    continue
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("[WB/detail] Ошибка детализации: %s", exc)
-                    self._rotate_proxy("detail_error", slow_next=True)
-                    await asyncio.sleep(min(0.4 * attempts, 1.2))
-                    continue
+                else:
+                    items = payload.get("data", {}).get("products") if isinstance(payload, Mapping) else None
+                    if isinstance(items, list):
+                        products = [dict(item) for item in items if isinstance(item, Mapping)]
 
-                if not payload:
-                    logger.warning("[WB/detail] Пустой ответ детализации для %s", len(batch))
-                    break
+            return status_code, products, body_len
 
-                details = payload.get("data", {}).get("products", [])
-                for item in details:
-                    if isinstance(item, Mapping) and item.get("id") is not None:
+        async def _process_batch(
+            ids: list[int],
+            *,
+            allow_rotate: bool,
+            chunk_size: int,
+        ) -> bool:
+            if not ids:
+                return True
+            size = max(min(chunk_size, len(ids)), min_chunk)
+            meta["final_chunk"] = min(meta["final_chunk"], size)
+            attempt = 0
+            rotated_here = False
+            while attempt < DETAIL_MAX_RETRIES:
+                attempt += 1
+                status, products, body_len = await _detail_request(
+                    DETAIL_API_URL_V2,
+                    ids,
+                    "v2",
+                )
+                should_retry = False
+                rotate_reason: str | None = None
+                rotated_flag = 0
+                proxy_snapshot = (
+                    sanitize_proxy(self._proxy_current or self._current_http_proxy_raw())
+                    or "-"
+                )
+                logger.info(
+                    "detail_chunk variant=%s n=%s status=%s len=%s products=%s proxy=%s rotated=%s retries=%s size=%s dest=%s spp=%s",
+                    "v2",
+                    len(ids),
+                    status if status is not None else "-",
+                    body_len,
+                    len(products),
+                    proxy_snapshot,
+                    rotated_flag,
+                    max(0, attempt - 1),
+                    size,
+                    dest_value,
+                    spp_value,
+                )
+                if status in {429, 403, 498, 502, 503, 504, None}:
+                    should_retry = True
+                    rotate_reason = f"detail_status_{status or 'error'}"
+                if status == 200 and not products and DETAIL_USE_V4_FALLBACK:
+                    status_v4, products, body_len_v4 = await _detail_request(
+                        DETAIL_API_URL_V4,
+                        ids,
+                        "v4",
+                    )
+                    if status_v4 in {429, 403, 498, 502, 503, 504, None}:
+                        should_retry = True
+                        rotate_reason = f"detail_status_{status_v4 or 'error'}"
+                    status = status_v4
+                    proxy_snapshot = (
+                        sanitize_proxy(self._proxy_current or self._current_http_proxy_raw())
+                        or "-"
+                    )
+                    logger.info(
+                        "detail_chunk variant=%s n=%s status=%s len=%s products=%s proxy=%s rotated=%s retries=%s size=%s dest=%s spp=%s",
+                        "v4",
+                        len(ids),
+                        status if status is not None else "-",
+                        body_len_v4,
+                        len(products),
+                        proxy_snapshot,
+                        rotated_flag,
+                        max(0, attempt - 1),
+                        size,
+                        dest_value,
+                        spp_value,
+                    )
+
+                if products:
+                    meta["final_chunk"] = size
+                    if len(ids) == 1:
+                        meta["singles"] += 1
+                    else:
+                        meta["chunks"] += 1
+                    for item in products:
+                        product_id = item.get("id")
                         try:
-                            aggregated[int(item.get("id"))] = dict(item)
+                            product_id_int = int(product_id)
                         except (TypeError, ValueError):
                             continue
-                break
-            else:
-                logger.warning(
-                    "[WB/detail] Не удалось обогатить %s товаров после %s попыток",
-                    len(batch),
-                    DETAIL_MAX_ATTEMPTS,
-                )
+                        products_map[product_id_int] = item
+                    return True
 
-        return aggregated
+                if rotate_reason and allow_rotate:
+                    rotated_here = True
+                    rotated_flag = 1
+                    self._rotate_proxy(rotate_reason, slow_next=True)
+                    meta["rotations"] += 1
+                    allow_rotate = False
+                    proxy_snapshot = (
+                        sanitize_proxy(self._proxy_current or self._current_http_proxy_raw())
+                        or "-"
+                    )
+                    logger.info(
+                        "detail_chunk variant=%s n=%s status=%s len=%s products=%s proxy=%s rotated=%s retries=%s size=%s dest=%s spp=%s",
+                        rotate_reason,
+                        len(ids),
+                        status if status is not None else "-",
+                        body_len,
+                        len(products),
+                        proxy_snapshot,
+                        rotated_flag,
+                        max(0, attempt - 1),
+                        size,
+                        dest_value,
+                        spp_value,
+                    )
+                if attempt < DETAIL_MAX_RETRIES and should_retry:
+                    meta["retries"] += 1
+                    await asyncio.sleep(random.uniform(jitter_min, jitter_max))
+                    continue
+                break
+
+            if rotated_here and DETAIL_ROTATE_ON_EMPTY and len(ids) == 1:
+                return await _process_batch(ids, allow_rotate=False, chunk_size=chunk_size)
+
+            return False
+
+        async def _process_ids(ids: list[int], chunk_size: int, *, allow_rotate: bool) -> None:
+            if not ids:
+                return
+            size = max(min(chunk_size, len(ids)), min_chunk)
+            index = 0
+            while index < len(ids):
+                batch = ids[index : index + size]
+                index += size
+                success = await _process_batch(batch, allow_rotate=allow_rotate, chunk_size=size)
+                if success:
+                    continue
+                if size > min_chunk:
+                    await _process_ids(batch, max(size // 2, min_chunk), allow_rotate=allow_rotate)
+                else:
+                    if allow_rotate and DETAIL_ROTATE_ON_EMPTY:
+                        self._rotate_proxy("detail_empty", slow_next=True)
+                        meta["rotations"] += 1
+                        await asyncio.sleep(random.uniform(jitter_min, jitter_max))
+                        await _process_ids(batch, size, allow_rotate=False)
+                    else:
+                        failed_ids.update(batch)
+
+        await _process_ids(unique_ids, max_chunk, allow_rotate=True)
+
+        duration_ms = (time.monotonic() - start_time) * 1000
+        meta["duration_ms"] = duration_ms
+        if failed_ids:
+            meta["dom_only"] = True
+            logger.warning(
+                "[WB/detail] DOM-only fallback для %s товаров", len(failed_ids)
+            )
+
+        return products_map, meta
 
     def _build_product(
         self,

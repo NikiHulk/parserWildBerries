@@ -72,9 +72,38 @@ async def _run(args: argparse.Namespace) -> None:
         proxy = summary.get("proxy") or "-"
         proxy_rotated = " proxy_rotated=1" if summary.get("proxy_rotated") else ""
         slow = bool(summary.get("slow"))
-        extra = ""
+        extra_parts: list[str] = []
         if html_ids is not None:
-            extra = f" ids={html_ids} enriched={html_enriched}"
+            extra_parts.append(f"ids={html_ids} enriched={html_enriched}")
+        detail_chunks = summary.get("detail_chunks")
+        detail_singles = summary.get("detail_singles")
+        detail_retries = summary.get("detail_retries")
+        detail_rotations = summary.get("detail_rotations")
+        detail_time_ms = summary.get("detail_time_ms")
+        detail_final_chunk = summary.get("detail_final_chunk")
+        if (
+            detail_chunks is not None
+            or detail_singles is not None
+            or detail_retries is not None
+            or detail_final_chunk is not None
+        ):
+            detail_parts = []
+            if detail_chunks is not None:
+                detail_parts.append(f"chunks={detail_chunks}")
+            if detail_singles is not None:
+                detail_parts.append(f"singles={detail_singles}")
+            if detail_retries is not None:
+                detail_parts.append(f"retries={detail_retries}")
+            if detail_rotations:
+                detail_parts.append(f"rotations={detail_rotations}")
+            if detail_time_ms is not None:
+                detail_parts.append(f"time={int(detail_time_ms)}ms")
+            if detail_final_chunk is not None:
+                detail_parts.append(f"final_chunk={detail_final_chunk}")
+            extra_parts.append("detail:" + " ".join(detail_parts))
+        if summary.get("detail_dom_only"):
+            extra_parts.append("detail_dom_only=1")
+        extra = f" {' '.join(extra_parts)}" if extra_parts else ""
         print(
             "source={source} page={page} status={status} products={products} "
             "limit={limit} dest={dest} spp={spp} cache={cache} slow={slow} "
