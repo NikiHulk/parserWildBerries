@@ -59,9 +59,9 @@ async def _run(args: argparse.Namespace) -> None:
     banned: List[str] = args.banned or []
     products = await client.search_products(
         query=args.query,
-        min_price=_parse_price(args.min),
-        max_price=_parse_price(args.max),
-        banned_words=banned,
+        min_price_rub=_parse_price(args.min),
+        max_price_rub=_parse_price(args.max),
+        exclude_words=banned,
         max_results=args.limit or settings.max_results,
         timeout=settings.request_timeout,
     )

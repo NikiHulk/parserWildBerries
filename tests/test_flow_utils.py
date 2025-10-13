@@ -105,12 +105,14 @@ class ScoreItemTest(unittest.TestCase):
             url="https://example.com",
             image_url=None,
         )
-        pct, gain, rating, reviews, stock = score_item(product)
-        self.assertAlmostEqual(pct, 50.0, places=1)
-        self.assertEqual(gain, 30)
-        self.assertAlmostEqual(rating, 4.5)
-        self.assertEqual(reviews, 120)
-        self.assertEqual(stock, 15)
+        score = score_item(product)
+        self.assertEqual(len(score), 5)
+        pct, gain, rating, reviews, price = score
+        self.assertAlmostEqual(pct, -50.0, places=1)
+        self.assertAlmostEqual(gain, -30.0, places=1)
+        self.assertAlmostEqual(rating, -4.5)
+        self.assertAlmostEqual(reviews, -120.0)
+        self.assertAlmostEqual(price, 30.0)
 
 
 if __name__ == "__main__":

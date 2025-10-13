@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Dict, Optional
 
+from bot.services.wildberries import _price_rub_from_detail
+
 
 def _fmt_int(value: Optional[float]) -> str:
     if value is None:
@@ -15,11 +17,10 @@ def _fmt_int(value: Optional[float]) -> str:
 
 
 def _sale_price(product: Dict) -> float:
-    price_units = product.get("salePriceU") or product.get("priceU") or 0
-    try:
-        return float(price_units) / 100.0
-    except (TypeError, ValueError):  # noqa: BLE001
+    price_rub = _price_rub_from_detail(product)
+    if price_rub is None:
         return 0.0
+    return float(price_rub)
 
 
 def _stock(product: Dict) -> int:

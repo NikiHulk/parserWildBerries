@@ -397,7 +397,7 @@ async def handle_max_price(message: Message, state: FSMContext) -> None:
                 reply_markup=cancel_kb(CANCEL_TEXT),
             )
             return
-    await state.update_data(max_price=price)
+    await state.update_data(max_price_rub=price)
     await state.set_state(SearchStates.entering_excludes)
     await message.answer(
         (
@@ -425,7 +425,7 @@ async def handle_excludes(message: Message, state: FSMContext) -> None:
         banned_words = parse_excludes(text)
     data = await state.get_data()
     query = data.get("query")
-    max_price = data.get("max_price")
+    max_price_rub = data.get("max_price_rub")
 
     settings = get_settings()
     client = WildberriesClient(
@@ -443,9 +443,9 @@ async def handle_excludes(message: Message, state: FSMContext) -> None:
     try:
         products = await client.search_products(
             query=query,
-            min_price=None,
-            max_price=max_price,
-            banned_words=banned_words,
+            max_price_rub=max_price_rub,
+            exclude_words=banned_words,
+            top_k=TOP_K,
             max_results=max(settings.max_results, PAGE_SIZE * 5),
             timeout=settings.request_timeout,
         )
@@ -464,21 +464,7 @@ async def handle_excludes(message: Message, state: FSMContext) -> None:
         )
         return
 
-    filtered_products: List[Any] = []
-    for product in products:
-        if max_price is not None:
-            limit_value = float(max_price)
-            price_value = (
-                getattr(product, "wallet_price", None)
-                or getattr(product, "price", None)
-            )
-            if price_value is not None and price_value > limit_value:
-                continue
-        if _product_matches_excludes(product, banned_words):
-            continue
-        filtered_products.append(product)
-
-    if not filtered_products:
+    if not products:
         if progress_message:
             try:
                 await message.bot.delete_message(
@@ -493,10 +479,9 @@ async def handle_excludes(message: Message, state: FSMContext) -> None:
         )
         return
 
-    ranked_products = sorted(filtered_products, key=score_item, reverse=True)
-    best_products = ranked_products[:TOP_K]
-
-    items = [_product_to_payload(product) for product in best_products]
+    payloads = [_product_to_payload(product) for product in products]
+    items = sorted(payloads, key=score_item)
+    items = items[:TOP_K]
 
     await state.update_data(
         results=items,

@@ -172,9 +172,9 @@ async def process_max_price(
     try:
         products = await client.search_products(
             query=query,
-            min_price=min_price,
-            max_price=max_price,
-            banned_words=user_banned,
+            min_price_rub=min_price,
+            max_price_rub=max_price,
+            exclude_words=user_banned,
             max_results=settings.max_results,
             timeout=settings.request_timeout,
         )

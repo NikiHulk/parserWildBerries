@@ -75,6 +75,23 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _env_optional_int(name: str, default: int | None) -> int | None:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    try:
+        candidate = int(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Некорректное значение %s=%r, используется %s",
+            name,
+            value,
+            default,
+        )
+        return default
+    return candidate
+
+
 DETAIL_MAX_CHUNK = max(1, _env_int("WB_DETAIL_MAX_CHUNK", 24))
 DETAIL_MIN_CHUNK = max(1, _env_int("WB_DETAIL_MIN_CHUNK", 1))
 if DETAIL_MIN_CHUNK > DETAIL_MAX_CHUNK:
@@ -84,6 +101,9 @@ DETAIL_JITTER_MIN = max(0.0, _env_int("WB_DETAIL_JITTER_MIN_MS", 150) / 1000)
 DETAIL_JITTER_MAX = max(DETAIL_JITTER_MIN, _env_int("WB_DETAIL_JITTER_MAX_MS", 350) / 1000)
 DETAIL_ROTATE_ON_EMPTY = _env_bool("WB_DETAIL_ROTATE_ON_EMPTY", True)
 DETAIL_USE_V4_FALLBACK = _env_bool("WB_DETAIL_USE_V4_FALLBACK", True)
+DEFAULT_MIN_PRICE_RUB = _env_optional_int("WB_DEFAULT_MIN_PRICE", None)
+DEFAULT_MAX_PRICE_RUB = _env_optional_int("WB_DEFAULT_MAX_PRICE", None)
+DEFAULT_LIMIT = max(1, _env_int("WB_DEFAULT_LIMIT", 10))
 
 from bot.utils.proxy import (
     ProxyRotator,
@@ -207,6 +227,75 @@ def _extract_numeric(item: Any, *names: str) -> float | int | None:
     return None
 
 
+def _price_rub_from_detail(item: Mapping[str, Any] | Any) -> int | None:
+    """Returns final client price in rubles using Wildberries detail payload."""
+
+    if isinstance(item, Mapping):
+        extended = item.get("extended") if isinstance(item.get("extended"), Mapping) else None
+    else:
+        extended = getattr(item, "extended", None)
+        if not isinstance(extended, Mapping):
+            extended = None
+
+    candidates: list[Any] = []
+    if extended:
+        candidates.append(extended.get("clientPriceU"))
+    if isinstance(item, Mapping):
+        candidates.extend(
+            [
+                item.get("clientPriceU"),
+                item.get("salePriceU"),
+                item.get("priceU"),
+            ]
+        )
+    else:
+        candidates.extend(
+            [
+                getattr(item, "clientPriceU", None),
+                getattr(item, "salePriceU", None),
+                getattr(item, "priceU", None),
+            ]
+        )
+
+    for candidate in candidates:
+        if isinstance(candidate, Mapping):
+            candidate = candidate.get("value") or candidate.get("price")
+        if isinstance(candidate, (int, float)) and candidate > 0:
+            return int(round(candidate / 100))
+    return None
+
+
+def profit_from_detail(item: Any) -> tuple[int, float]:
+    """Calculates absolute and percentage profit from enriched item data."""
+
+    buy_raw = _extract_numeric(
+        item,
+        "price_wb_wallet",
+        "wallet_price",
+        "walletPrice",
+        "price",
+    )
+    sell_raw = _extract_numeric(
+        item,
+        "best_buy_price",
+        "best_buyout_price",
+        "best_buy_price_rub",
+    )
+
+    try:
+        buy = float(buy_raw)
+        sell = float(sell_raw)
+    except (TypeError, ValueError):  # noqa: BLE001
+        return (0, 0.0)
+
+    if buy <= 0 or sell <= 0:
+        return (0, 0.0)
+
+    abs_gain = max(0, int(round(sell - buy)))
+    pct = (abs_gain / sell) * 100.0 if sell else 0.0
+    return (abs_gain, pct)
+
+
 def compute_profit(item: Any) -> tuple[float, int]:
     """Возвращает (процент, абсолютный профит) для карточки."""
 
@@ -229,28 +318,41 @@ def compute_profit(item: Any) -> tuple[float, int]:
     return (pct, abs_gain)
 
 
-def score_item(item: Any) -> tuple[float, int, float, int, int]:
-    """Композитный скоринг для выбора TOP-K предложений в боте."""
+def score_item(item: Any) -> tuple[float, float, float, float, float]:
+    """Composite score tuple (smaller is better for sorting)."""
 
-    pct, gain = compute_profit(item)
+    profit_abs, profit_pct = profit_from_detail(item)
     rating_raw = _extract_numeric(item, "rating", "reviewRating")
     feedbacks_raw = _extract_numeric(item, "feedbacks", "reviews")
-    stock_raw = _extract_numeric(item, "stock", "stocks", "wh")
+    stock_raw = _extract_numeric(item, "stock", "stocks", "wh", "totalQuantity")
+    price_rub = _price_rub_from_detail(item)
+    if price_rub is None:
+        fallback_price = _extract_numeric(item, "price", "wallet_price", "walletPrice")
+        try:
+            price_rub = int(round(float(fallback_price)))
+        except (TypeError, ValueError):
+            price_rub = 10**9
 
     try:
         rating = float(rating_raw) if rating_raw is not None else 0.0
     except (TypeError, ValueError):  # noqa: BLE001
         rating = 0.0
     try:
-        feedbacks = int(feedbacks_raw) if feedbacks_raw is not None else 0
+        feedbacks = float(feedbacks_raw) if feedbacks_raw is not None else 0.0
     except (TypeError, ValueError):  # noqa: BLE001
-        feedbacks = 0
+        feedbacks = 0.0
     try:
-        stock = int(stock_raw) if stock_raw is not None else 0
+        stock = float(stock_raw) if stock_raw is not None else 0.0
     except (TypeError, ValueError):  # noqa: BLE001
-        stock = 0
+        stock = 0.0
 
-    return (pct, gain, rating, feedbacks, stock)
+    return (
+        -float(profit_pct or 0.0),
+        -float(profit_abs or 0.0),
+        -rating,
+        -feedbacks,
+        float(price_rub),
+    )
 
 
 @dataclass(slots=True)
@@ -343,6 +445,9 @@ class WildberriesClient:
             float(page_delay_ms) / 1000 if page_delay_ms is not None else None
         )
         self._page_delay_range = PAGE_DELAY_RANGE
+        self._default_min_price = DEFAULT_MIN_PRICE_RUB
+        self._default_max_price = DEFAULT_MAX_PRICE_RUB
+        self._default_limit = DEFAULT_LIMIT
         self._cookie_file = COOKIE_FILE
         self._cookie_ttl = COOKIE_TTL_SECONDS
         self._cookie_cache: list[dict[str, Any]] | None = None
@@ -511,43 +616,70 @@ class WildberriesClient:
     async def search_products(
         self,
         query: str,
-        min_price: int | None,
-        max_price: int | None,
-        banned_words: list[str],
-        max_results: int,
-        timeout: int,
+        *,
+        min_price_rub: int | None = None,
+        max_price_rub: int | None = None,
+        exclude_words: Iterable[str] | None = None,
+        top_k: int | None = None,
+        max_results: int | None = None,
+        timeout: float | None = None,
     ) -> List[Product]:
-        if max_results <= 0:
-            return []
         self._last_page_logs = []
 
-        min_price_rub = self._normalize_price(min_price)
-        max_price_rub = self._normalize_price(max_price)
+        effective_timeout = float(timeout or self._timeout)
+        limit = max_results if max_results and max_results > 0 else self._default_limit
+        if limit <= 0:
+            return []
+
+        effective_top = None
+        if top_k is not None:
+            try:
+                parsed_top = int(top_k)
+            except (TypeError, ValueError):  # noqa: BLE001
+                parsed_top = None
+            if parsed_top is not None and parsed_top > 0:
+                effective_top = parsed_top
+
+        collect_limit = max(limit, effective_top) if effective_top else limit
+
+        min_price_candidate = (
+            self._normalize_price(min_price_rub)
+            if min_price_rub is not None
+            else self._default_min_price
+        )
+        max_price_candidate = (
+            self._normalize_price(max_price_rub)
+            if max_price_rub is not None
+            else self._default_max_price
+        )
 
         if (
-            min_price_rub is not None
-            and max_price_rub is not None
-            and min_price_rub > max_price_rub
+            min_price_candidate is not None
+            and max_price_candidate is not None
+            and min_price_candidate > max_price_candidate
         ):
-            min_price_rub, max_price_rub = max_price_rub, min_price_rub
+            min_price_candidate, max_price_candidate = (
+                max_price_candidate,
+                min_price_candidate,
+            )
+
+        min_price_rub = min_price_candidate
+        max_price_rub = max_price_candidate
 
         normalized_banned = {
             word.strip().lower()
-            for word in banned_words
+            for word in (exclude_words or [])
             if isinstance(word, str) and word.strip()
         }
 
         filtered_candidates: list[dict[str, Any]] = []
         filtered_by_price = 0
         filtered_by_banned = 0
-        filtered_by_rating = 0
-        filtered_by_feedbacks = 0
-        filtered_by_discount = 0
+        filtered_by_quality = 0
         total_received = 0
         consecutive_empty_pages = 0
         rate_limit_hits = 0
 
-        effective_timeout = float(timeout or self._timeout)
         current_limit = START_LIMIT
 
         session_headers = dict(self._headers)
@@ -558,7 +690,7 @@ class WildberriesClient:
         page = 1
 
         try:
-            while len(filtered_candidates) < max_results:
+            while len(filtered_candidates) < collect_limit:
                 client = await self._ensure_http_client(
                     session_headers, effective_timeout
                 )
@@ -583,9 +715,7 @@ class WildberriesClient:
                 before_count = len(products_list)
                 page_price_filtered = 0
                 page_banned_filtered = 0
-                page_rating_filtered = 0
-                page_feedback_filtered = 0
-                page_discount_filtered = 0
+                page_quality_filtered = 0
 
                 if not products_list:
                     consecutive_empty_pages += 1
@@ -597,6 +727,8 @@ class WildberriesClient:
                         after_banned=0,
                         after_quality=0,
                         total=len(filtered_candidates),
+                        eff_min=min_price_rub,
+                        eff_max=max_price_rub,
                     )
 
                     if page_meta.had_429:
@@ -609,7 +741,7 @@ class WildberriesClient:
                     if consecutive_empty_pages >= 2:
                         break
 
-                    if total_received >= max(100, max_results * 2):
+                    if total_received >= max(100, collect_limit * 2):
                         break
 
                     page += 1
@@ -630,62 +762,65 @@ class WildberriesClient:
                     if product_id is None:
                         continue
 
-                    price_units = item.get("salePriceU") or item.get("priceU")
-                    price_rub = self._price_units_to_rub(price_units)
-
-                    if (
-                        min_price_rub is not None
-                        and (price_rub is None or price_rub < min_price_rub)
-                    ):
+                    price_rub = _price_rub_from_detail(item)
+                    if price_rub is None:
                         filtered_by_price += 1
                         page_price_filtered += 1
                         continue
 
-                    if (
-                        max_price_rub is not None
-                        and (price_rub is None or price_rub > max_price_rub)
-                    ):
+                    if min_price_rub is not None and price_rub < min_price_rub:
+                        filtered_by_price += 1
+                        page_price_filtered += 1
+                        continue
+
+                    if max_price_rub is not None and price_rub > max_price_rub:
                         filtered_by_price += 1
                         page_price_filtered += 1
                         continue
 
                     if normalized_banned:
-                        haystack = (
-                            f"{item.get('name', '')} {item.get('brand', '')}"
-                        ).lower()
+                        haystack_parts = [
+                            str(item.get("name", "")),
+                            str(item.get("brand", "")),
+                        ]
+                        features = item.get("features") or []
+                        if isinstance(features, Sequence):
+                            haystack_parts.extend(str(value) for value in features)
+                        haystack = " ".join(haystack_parts).lower()
                         if any(word in haystack for word in normalized_banned):
                             filtered_by_banned += 1
                             page_banned_filtered += 1
                             continue
 
-                    rating = self._safe_float(item.get("reviewRating"))
+                    rating = self._safe_float(
+                        item.get("reviewRating") or item.get("rating")
+                    )
+                    feedbacks = self._safe_int(item.get("feedbacks"))
+                    discount_percent = self._compute_discount_percent(item)
+
+                    quality_failed = False
                     if (
                         self._min_rating is not None
                         and rating is not None
                         and rating < self._min_rating
                     ):
-                        filtered_by_rating += 1
-                        page_rating_filtered += 1
-                        continue
-
-                    feedbacks = self._safe_int(item.get("feedbacks"))
+                        quality_failed = True
                     if (
                         self._min_feedbacks is not None
                         and feedbacks is not None
                         and feedbacks < self._min_feedbacks
                     ):
-                        filtered_by_feedbacks += 1
-                        page_feedback_filtered += 1
-                        continue
-
-                    discount_percent = self._compute_discount_percent(item)
+                        quality_failed = True
                     if (
                         self._min_discount is not None
                         and discount_percent is not None
                         and discount_percent < self._min_discount
                     ):
-                        filtered_by_discount += 1
-                        page_discount_filtered += 1
+                        quality_failed = True
+
+                    if quality_failed:
+                        filtered_by_quality += 1
+                        page_quality_filtered += 1
                         continue
 
                     candidate = {
@@ -697,14 +832,14 @@ class WildberriesClient:
                     }
                     page_candidates.append(candidate)
 
-                    if len(filtered_candidates) + len(page_candidates) >= max_results:
+                    if len(filtered_candidates) + len(page_candidates) >= limit:
                         break
 
                 filtered_candidates.extend(page_candidates)
 
-                after_price_count = before_count - page_price_filtered
-                after_banned_count = after_price_count - page_banned_filtered
-                after_quality_count = len(page_candidates)
+                after_price_count = page_price_filtered
+                after_banned_count = page_banned_filtered
+                after_quality_count = page_quality_filtered
 
                 top_items: list[dict[str, Any]] = []
                 for candidate in page_candidates[:3]:
@@ -730,6 +865,8 @@ class WildberriesClient:
                     after_quality=after_quality_count,
                     total=len(filtered_candidates),
                     top_items=top_items,
+                    eff_min=min_price_rub,
+                    eff_max=max_price_rub,
                 )
 
                 if page_meta.had_429:
@@ -739,10 +876,10 @@ class WildberriesClient:
                         rate_limit_hits,
                     )
 
-                if len(filtered_candidates) >= max_results:
+                if len(filtered_candidates) >= collect_limit:
                     break
 
-                if total_received >= max(100, max_results * 2):
+                if total_received >= max(100, collect_limit * 2):
                     break
 
                 page += 1
@@ -767,12 +904,8 @@ class WildberriesClient:
                 reason_parts.append("min/max")
             if filtered_by_banned:
                 reason_parts.append("banned words")
-            if filtered_by_rating:
-                reason_parts.append("rating")
-            if filtered_by_feedbacks:
-                reason_parts.append("feedbacks")
-            if filtered_by_discount:
-                reason_parts.append("discount")
+            if filtered_by_quality:
+                reason_parts.append("quality")
             reason = ", ".join(reason_parts) or "unknown"
             logger.info("После фильтрации товаров нет (reason: %s)", reason)
             return []
@@ -794,7 +927,10 @@ class WildberriesClient:
             len(filtered_candidates),
         )
 
-        limited_candidates = filtered_candidates[:max_results]
+        final_limit = limit
+        if effective_top is not None:
+            final_limit = min(limit, effective_top)
+        limited_candidates = filtered_candidates[:final_limit]
         ids_for_detail: list[int] = []
         for candidate in limited_candidates:
             try:
@@ -1281,6 +1417,8 @@ class WildberriesClient:
         after_quality: int,
         total: int,
         top_items: list[dict[str, Any]] | None = None,
+        eff_min: int | None = None,
+        eff_max: int | None = None,
     ) -> None:
         summary = {
             "page": page,
@@ -1314,6 +1452,8 @@ class WildberriesClient:
             "detail_batches": page_meta.detail_batches,
             "detail_enriched_total": page_meta.detail_enriched_total,
             "detail_used_v4": page_meta.detail_used_v4,
+            "eff_min": eff_min,
+            "eff_max": eff_max,
         }
         self._last_page_logs.append(summary)
         proxy_used = summary["proxy"]
@@ -1371,13 +1511,15 @@ class WildberriesClient:
             extra_suffix,
         )
         logger.info(
-            "WB filter page=%s before=%s after_price=%s after_banned=%s after_quality=%s total=%s",
+            "WB filter page=%s before=%s after_price=%s after_banned=%s after_quality=%s total=%s eff_min=%s eff_max=%s",
             page,
             before_count,
             after_price,
             after_banned,
             after_quality,
             total,
+            eff_min,
+            eff_max,
         )
 
     def _cache_key(
