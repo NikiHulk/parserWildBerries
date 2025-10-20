@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Dict, Optional
 
-from bot.services.wildberries import _price_rub_from_detail
+from bot.services.wildberries import _price_rub_from_detail, extract_price_rub
 
 
 def _fmt_int(value: Optional[float]) -> str:
@@ -17,10 +17,14 @@ def _fmt_int(value: Optional[float]) -> str:
 
 
 def _sale_price(product: Dict) -> float:
-    price_rub = _price_rub_from_detail(product)
-    if price_rub is None:
+    price = product.get("_price_rub")
+    if price is None:
+        price = extract_price_rub(product)
+    if price is None:
+        price = _price_rub_from_detail(product)
+    if price is None:
         return 0.0
-    return float(price_rub)
+    return float(price)
 
 
 def _stock(product: Dict) -> int:
@@ -36,10 +40,12 @@ def _stock(product: Dict) -> int:
 
 def build_caption(product: Dict, target_buy_price: Optional[float] = None) -> str:
     name = product.get("name") or "Товар"
+    sale_price = product.get("_price_rub")
+    if sale_price is None:
+        sale_price = _sale_price(product)
     wallet_price = product.get("price_wb_wallet") or product.get("wallet_price")
     if wallet_price is None:
-        wallet_price = _sale_price(product)
-    sale_price = wallet_price
+        wallet_price = sale_price
     rating = product.get("rating") or 0
     feedbacks = product.get("feedbacks") or 0
     colors = product.get("colors") or []

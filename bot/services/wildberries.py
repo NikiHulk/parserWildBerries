@@ -228,54 +228,122 @@ def _extract_numeric(item: Any, *names: str) -> float | int | None:
     return None
 
 
+def extract_price_rub(prod: Mapping[str, Any] | Any) -> float | None:
+    """Ищет минимальную положительную цену в копейках и возвращает её в рублях."""
+
+    keys = ("salePriceU", "priceU", "basicPriceU", "totalPriceU")
+    candidates: list[int] = []
+
+    def _collect(source: Mapping[str, Any] | Any) -> None:
+        if isinstance(source, Mapping):
+            for key in keys:
+                value = source.get(key)
+                if isinstance(value, int) and value > 0:
+                    candidates.append(value)
+        else:
+            for key in keys:
+                value = getattr(source, key, None)
+                if isinstance(value, int) and value > 0:
+                    candidates.append(value)
+
+    _collect(prod)
+
+    if isinstance(prod, Mapping):
+        sizes = prod.get("sizes")
+    else:
+        sizes = getattr(prod, "sizes", None)
+
+    if isinstance(sizes, Sequence):
+        for size in sizes:
+            price_block: Any
+            if isinstance(size, Mapping):
+                price_block = size.get("price")
+            else:
+                price_block = getattr(size, "price", None)
+            if isinstance(price_block, Mapping):
+                _collect(price_block)
+            elif price_block is not None:
+                _collect(price_block)
+
+    if not candidates:
+        return None
+    return min(candidates) / 100.0
+
+
+def _passes_price_limits(
+    item: Mapping[str, Any] | Any,
+    eff_min: int | None,
+    eff_max: int | None,
+) -> tuple[bool, float | None]:
+    """Checks price limits and returns (allowed, extracted_price)."""
+
+    stored: Any
+    if isinstance(item, Mapping):
+        stored = item.get("_price_rub")
+    else:
+        stored = getattr(item, "_price_rub", None)
+
+    price = None
+    if stored is not None:
+        try:
+            price = float(stored)
+        except (TypeError, ValueError):  # noqa: BLE001
+            price = None
+
+    if price is None:
+        price = extract_price_rub(item)
+        if price is not None and isinstance(item, dict):
+            item.setdefault("_price_rub", price)
+
+    if price is None:
+        return False, None
+
+    if eff_min is not None and price < eff_min:
+        return False, price
+    if eff_max is not None and price > eff_max:
+        return False, price
+    return True, price
+
+
 def _price_rub_from_detail(item: Mapping[str, Any] | Any) -> int | None:
-    """Returns final client price in rubles using Wildberries detail payload."""
+    """Returns final client price in whole rubles using cached or extracted data."""
 
+    stored: Any
     if isinstance(item, Mapping):
-        extended = item.get("extended") if isinstance(item.get("extended"), Mapping) else None
+        stored = item.get("_price_rub")
     else:
-        extended = getattr(item, "extended", None)
-        if not isinstance(extended, Mapping):
-            extended = None
+        stored = getattr(item, "_price_rub", None)
 
-    candidates: list[Any] = []
-    if extended:
-        candidates.append(extended.get("clientPriceU"))
-    if isinstance(item, Mapping):
-        candidates.extend(
-            [
-                item.get("clientPriceU"),
-                item.get("salePriceU"),
-                item.get("priceU"),
-            ]
-        )
-    else:
-        candidates.extend(
-            [
-                getattr(item, "clientPriceU", None),
-                getattr(item, "salePriceU", None),
-                getattr(item, "priceU", None),
-            ]
-        )
+    if stored is not None:
+        try:
+            return int(round(float(stored)))
+        except (TypeError, ValueError):  # noqa: BLE001
+            stored = None
 
-    for candidate in candidates:
-        if isinstance(candidate, Mapping):
-            candidate = candidate.get("value") or candidate.get("price")
-        if isinstance(candidate, (int, float)) and candidate > 0:
-            return int(round(candidate / 100))
-    return None
+    price = extract_price_rub(item)
+    if price is None:
+        return None
+    try:
+        return int(round(float(price)))
+    except (TypeError, ValueError):  # noqa: BLE001
+        return None
 
 
 def profit_from_detail(item: Any) -> tuple[int, float]:
     """Calculates absolute and percentage profit from enriched item data."""
 
-    buy_raw = _extract_numeric(
-        item,
-        "price_wb_wallet",
-        "wallet_price",
-        "walletPrice",
-        "price",
-    )
+    if isinstance(item, Mapping):
+        buy_raw = item.get("_price_rub")
+    else:
+        buy_raw = getattr(item, "_price_rub", None)
+    if buy_raw is None:
+        buy_raw = _extract_numeric(
+            item,
+            "price_wb_wallet",
+            "wallet_price",
+            "walletPrice",
+            "price",
+        )
     sell_raw = _extract_numeric(
         item,
         "best_buy_price",
@@ -300,7 +368,12 @@ def profit_from_detail(item: Any) -> tuple[int, float]:
 def compute_profit(item: Any) -> tuple[float, int]:
     """Возвращает (процент, абсолютный профит) для карточки."""
 
-    buy_raw = _extract_numeric(item, "price_wb_wallet", "wallet_price", "price")
+    if isinstance(item, Mapping):
+        buy_raw = item.get("_price_rub")
+    else:
+        buy_raw = getattr(item, "_price_rub", None)
+    if buy_raw is None:
+        buy_raw = _extract_numeric(item, "price_wb_wallet", "wallet_price", "price")
     sell_raw = _extract_numeric(
         item, "best_buy_price", "best_buyout_price", "best_buy_price_rub"
     )
@@ -757,24 +830,34 @@ class WildberriesClient:
                     headers=session_headers,
                 )
 
+                logger.info(
+                    "WB price filter eff_min=%s eff_max=%s candidates=%s",
+                    min_price_rub,
+                    max_price_rub,
+                    len(products_list),
+                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "price_sample_before=%s",
+                        [
+                            (p.get("_price_rub") if isinstance(p, Mapping) else None)
+                            or extract_price_rub(p)
+                            for p in products_list[:5]
+                        ],
+                    )
+
                 page_candidates: list[dict[str, Any]] = []
                 for item in products_list:
                     product_id = item.get("id")
                     if product_id is None:
                         continue
 
-                    price_rub = _price_rub_from_detail(item)
-                    if price_rub is None:
-                        filtered_by_price += 1
-                        page_price_filtered += 1
-                        continue
-
-                    if min_price_rub is not None and price_rub < min_price_rub:
-                        filtered_by_price += 1
-                        page_price_filtered += 1
-                        continue
-
-                    if max_price_rub is not None and price_rub > max_price_rub:
+                    allowed, price_rub_value = _passes_price_limits(
+                        item,
+                        min_price_rub,
+                        max_price_rub,
+                    )
+                    if not allowed or price_rub_value is None:
                         filtered_by_price += 1
                         page_price_filtered += 1
                         continue
@@ -826,7 +909,7 @@ class WildberriesClient:
 
                     candidate = {
                         "item": item,
-                        "price_rub": price_rub,
+                        "price_rub": price_rub_value,
                         "rating": rating,
                         "feedbacks": feedbacks,
                         "discount": discount_percent,
@@ -869,6 +952,12 @@ class WildberriesClient:
                     eff_min=min_price_rub,
                     eff_max=max_price_rub,
                 )
+
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "price_sample_after=%s",
+                        [candidate.get("price_rub") for candidate in page_candidates[:5]],
+                    )
 
                 if page_meta.had_429:
                     rate_limit_hits += 1
@@ -2131,14 +2220,10 @@ class WildberriesClient:
             if isinstance(detail, Mapping):
                 detail_copy = dict(detail)
                 detail_copy.setdefault("id", nm_id)
-                price_units = (
-                    detail_copy.get("salePriceU")
-                    or detail_copy.get("priceU")
-                    or detail_copy.get("extended", {}).get("clientPriceU")
-                )
-                price_rub = self._price_units_to_rub(price_units)
-                if price_rub is not None:
-                    detail_copy.setdefault("price_rub", price_rub)
+                price_rub_value = extract_price_rub(detail_copy)
+                if price_rub_value is not None:
+                    detail_copy["_price_rub"] = price_rub_value
+                    detail_copy.setdefault("price_rub", int(round(price_rub_value)))
                 enriched.append(detail_copy)
                 enriched_count += 1
             else:
@@ -2595,6 +2680,10 @@ class WildberriesClient:
                             product_id_int = int(product_id)
                         except (TypeError, ValueError):
                             continue
+                        price_val = extract_price_rub(item)
+                        if price_val is not None:
+                            item["_price_rub"] = price_val
+                            item.setdefault("price_rub", int(round(price_val)))
                         products_map[product_id_int] = item
                     return True, False
 
@@ -2698,10 +2787,24 @@ class WildberriesClient:
         discount: float | None = None,
     ) -> Product:
         product_id = int(base.get("id", detail.get("id", 0)))
-        sale_price = self._price_to_rub(base.get("salePriceU"))
-        wallet_price = self._price_to_rub(
-            detail.get("extended", {}).get("clientPriceU")
-            or base.get("salePriceU")
+        override_price = None
+        if isinstance(detail, Mapping):
+            override_price = detail.get("_price_rub")
+        if override_price is None:
+            override_price = extract_price_rub(detail) or extract_price_rub(base)
+
+        sale_price = (
+            float(override_price)
+            if override_price is not None
+            else self._price_to_rub(base.get("salePriceU"))
+        )
+        wallet_price = (
+            float(override_price)
+            if override_price is not None
+            else self._price_to_rub(
+                detail.get("extended", {}).get("clientPriceU")
+                or base.get("salePriceU")
+            )
         )
         best_buyout_price = self._price_to_rub(
             detail.get("extended", {}).get("promoPriceU")
