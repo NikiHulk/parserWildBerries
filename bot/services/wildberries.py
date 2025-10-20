@@ -92,15 +92,16 @@ def _env_optional_int(name: str, default: int | None) -> int | None:
     return candidate
 
 
-DETAIL_MAX_CHUNK = max(1, _env_int("WB_DETAIL_MAX_CHUNK", 24))
+DETAIL_MAX_BATCH = max(1, _env_int("WB_DETAIL_MAX_BATCH", 1))
 DETAIL_MIN_CHUNK = max(1, _env_int("WB_DETAIL_MIN_CHUNK", 1))
-if DETAIL_MIN_CHUNK > DETAIL_MAX_CHUNK:
-    DETAIL_MIN_CHUNK = DETAIL_MAX_CHUNK
+if DETAIL_MIN_CHUNK > DETAIL_MAX_BATCH:
+    DETAIL_MIN_CHUNK = DETAIL_MAX_BATCH
 DETAIL_MAX_RETRIES = max(1, _env_int("WB_DETAIL_MAX_RETRIES", 2))
 DETAIL_JITTER_MIN = max(0.0, _env_int("WB_DETAIL_JITTER_MIN_MS", 150) / 1000)
 DETAIL_JITTER_MAX = max(DETAIL_JITTER_MIN, _env_int("WB_DETAIL_JITTER_MAX_MS", 350) / 1000)
 DETAIL_ROTATE_ON_EMPTY = _env_bool("WB_DETAIL_ROTATE_ON_EMPTY", True)
 DETAIL_USE_V4_FALLBACK = _env_bool("WB_DETAIL_USE_V4_FALLBACK", True)
+DETAIL_SPLIT_ON_EMPTY = _env_bool("WB_DETAIL_SPLIT_ON_EMPTY", True)
 DEFAULT_MIN_PRICE_RUB = _env_optional_int("WB_DEFAULT_MIN_PRICE", None)
 DEFAULT_MAX_PRICE_RUB = _env_optional_int("WB_DEFAULT_MAX_PRICE", None)
 DEFAULT_LIMIT = max(1, _env_int("WB_DEFAULT_LIMIT", 10))
@@ -2443,7 +2444,7 @@ class WildberriesClient:
         )
         referer_url = referer or "https://www.wildberries.ru/"
 
-        max_chunk = min(DETAIL_MAX_CHUNK, len(unique_ids))
+        max_chunk = min(DETAIL_MAX_BATCH, len(unique_ids)) or 1
         min_chunk = min(DETAIL_MIN_CHUNK, max_chunk)
         jitter_min, jitter_max = DETAIL_JITTER_MIN, DETAIL_JITTER_MAX
 
@@ -2520,13 +2521,14 @@ class WildberriesClient:
             *,
             allow_rotate: bool,
             chunk_size: int,
-        ) -> bool:
+        ) -> tuple[bool, bool]:
             if not ids:
-                return True
+                return True, False
             size = max(min(chunk_size, len(ids)), min_chunk)
             meta["final_chunk"] = min(meta["final_chunk"], size)
             attempt = 0
             rotated_here = False
+            single_mode = len(ids) == 1
             while attempt < DETAIL_MAX_RETRIES:
                 attempt += 1
                 status, products, body_len = await _detail_request(
@@ -2536,29 +2538,28 @@ class WildberriesClient:
                 )
                 should_retry = False
                 rotate_reason: str | None = None
-                rotated_flag = 0
-                proxy_snapshot = (
-                    sanitize_proxy(self._proxy_current or self._current_http_proxy_raw())
-                    or "-"
-                )
                 logger.info(
-                    "detail_chunk via=httpx variant=%s n=%s status=%s len=%s products=%s proxy=%s rotated=%s retries=%s size=%s dest=%s spp=%s",
+                    "detail_chunk via=httpx variant=%s n=%s status=%s len=%s products=%s size=%s single_mode=%s dest=%s spp=%s",
                     "v2",
                     len(ids),
                     status if status is not None else "-",
                     body_len,
                     len(products),
-                    proxy_snapshot,
-                    rotated_flag,
-                    max(0, attempt - 1),
                     size,
+                    "1" if single_mode else "0",
                     dest_value,
                     spp_value,
                 )
+                empty_payload = status == 200 and not products
                 if status in {429, 403, 498, 502, 503, 504, None}:
                     should_retry = True
                     rotate_reason = f"detail_status_{status or 'error'}"
-                if status == 200 and not products and DETAIL_USE_V4_FALLBACK:
+                if (
+                    status == 200
+                    and not products
+                    and DETAIL_USE_V4_FALLBACK
+                    and (not DETAIL_SPLIT_ON_EMPTY or single_mode)
+                ):
                     meta["used_v4_fallback"] = True
                     status_v4, products, body_len_v4 = await _detail_request(
                         DETAIL_API_URL_V4,
@@ -2569,21 +2570,15 @@ class WildberriesClient:
                         should_retry = True
                         rotate_reason = f"detail_status_{status_v4 or 'error'}"
                     status = status_v4
-                    proxy_snapshot = (
-                        sanitize_proxy(self._proxy_current or self._current_http_proxy_raw())
-                        or "-"
-                    )
                     logger.info(
-                        "detail_chunk via=httpx variant=%s n=%s status=%s len=%s products=%s proxy=%s rotated=%s retries=%s size=%s dest=%s spp=%s",
+                        "detail_chunk via=httpx variant=%s n=%s status=%s len=%s products=%s size=%s single_mode=%s dest=%s spp=%s",
                         "v4",
                         len(ids),
                         status if status is not None else "-",
                         body_len_v4,
                         len(products),
-                        proxy_snapshot,
-                        rotated_flag,
-                        max(0, attempt - 1),
                         size,
+                        "1" if single_mode else "0",
                         dest_value,
                         spp_value,
                     )
@@ -2601,32 +2596,20 @@ class WildberriesClient:
                         except (TypeError, ValueError):
                             continue
                         products_map[product_id_int] = item
-                    return True
+                    return True, False
+
+                if (
+                    empty_payload
+                    and not single_mode
+                    and DETAIL_SPLIT_ON_EMPTY
+                ):
+                    return False, True
 
                 if rotate_reason and allow_rotate:
                     rotated_here = True
-                    rotated_flag = 1
                     self._rotate_proxy(rotate_reason, slow_next=True)
                     meta["rotations"] += 1
                     allow_rotate = False
-                    proxy_snapshot = (
-                        sanitize_proxy(self._proxy_current or self._current_http_proxy_raw())
-                        or "-"
-                    )
-                    logger.info(
-                        "detail_chunk via=httpx variant=%s n=%s status=%s len=%s products=%s proxy=%s rotated=%s retries=%s size=%s dest=%s spp=%s",
-                        rotate_reason,
-                        len(ids),
-                        status if status is not None else "-",
-                        body_len,
-                        len(products),
-                        proxy_snapshot,
-                        rotated_flag,
-                        max(0, attempt - 1),
-                        size,
-                        dest_value,
-                        spp_value,
-                    )
                 if attempt < DETAIL_MAX_RETRIES and should_retry:
                     meta["retries"] += 1
                     await asyncio.sleep(random.uniform(jitter_min, jitter_max))
@@ -2634,9 +2617,13 @@ class WildberriesClient:
                 break
 
             if rotated_here and DETAIL_ROTATE_ON_EMPTY and len(ids) == 1:
-                return await _process_batch(ids, allow_rotate=False, chunk_size=chunk_size)
+                return await _process_batch(
+                    ids,
+                    allow_rotate=False,
+                    chunk_size=chunk_size,
+                )
 
-            return False
+            return False, False
 
         async def _process_ids(ids: list[int], chunk_size: int, *, allow_rotate: bool) -> None:
             if not ids:
@@ -2646,11 +2633,33 @@ class WildberriesClient:
             while index < len(ids):
                 batch = ids[index : index + size]
                 index += size
-                success = await _process_batch(batch, allow_rotate=allow_rotate, chunk_size=size)
+                success, empty_payload = await _process_batch(
+                    batch,
+                    allow_rotate=allow_rotate,
+                    chunk_size=size,
+                )
                 if success:
                     continue
-                if size > min_chunk:
-                    await _process_ids(batch, max(size // 2, min_chunk), allow_rotate=allow_rotate)
+                if (
+                    empty_payload
+                    and DETAIL_SPLIT_ON_EMPTY
+                    and len(batch) > 1
+                ):
+                    for nm in batch:
+                        single_success, _ = await _process_batch(
+                            [nm],
+                            allow_rotate=allow_rotate,
+                            chunk_size=1,
+                        )
+                        if not single_success:
+                            failed_ids.add(nm)
+                    continue
+                if size > min_chunk and not DETAIL_SPLIT_ON_EMPTY:
+                    await _process_ids(
+                        batch,
+                        max(size // 2, min_chunk),
+                        allow_rotate=allow_rotate,
+                    )
                 else:
                     if allow_rotate and DETAIL_ROTATE_ON_EMPTY:
                         self._rotate_proxy("detail_empty", slow_next=True)

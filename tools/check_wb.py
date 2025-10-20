@@ -37,6 +37,10 @@ def _parse_price(value: str | int | None) -> int | None:
 
 async def _run(args: argparse.Namespace) -> None:
     settings = get_settings()
+    print(
+        "detail_config max_batch=%s split_on_empty=%s"
+        % (settings.wb_detail_max_batch, settings.wb_detail_split_on_empty)
+    )
     throttle = args.throttle
     if throttle is not None and throttle <= 0:
         throttle = None

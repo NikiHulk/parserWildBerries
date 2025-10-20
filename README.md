@@ -42,6 +42,8 @@ TG_SKIP_TEXT="⏭ Пропустить"
 WB_DEFAULT_MIN_PRICE=
 WB_DEFAULT_MAX_PRICE=
 WB_DEFAULT_LIMIT=8
+WB_DETAIL_MAX_BATCH=1
+WB_DETAIL_SPLIT_ON_EMPTY=1
 PLAYWRIGHT_THROTTLE_MS=2000
 PLAYWRIGHT_HEADLESS=true
 PLAYWRIGHT_TZ=Europe/Moscow
@@ -78,6 +80,7 @@ python -m bot.main
 Чтобы обходить антибот-проверки Wildberries и получать HTML-выдачу даже при 403/498, бот использует Playwright (headless Chromium) и пул прокси. Основные переменные окружения:
 
 - `WB_DEFAULT_MIN_PRICE` / `WB_DEFAULT_MAX_PRICE` / `WB_DEFAULT_LIMIT` — дефолтные параметры поиска для CLI/бота (если пользователь не указал иное).
+- `WB_DETAIL_MAX_BATCH` / `WB_DETAIL_SPLIT_ON_EMPTY` — ограничение на размер батча при обращении к detail API и стратегия деления пустых ответов (1 = сразу бить на одиночные запросы).
 - `PLAYWRIGHT_THROTTLE_MS` — базовая задержка между действиями браузера (по умолчанию 2000 мс). При агрессивных блокировках увеличьте значение.
 - `PLAYWRIGHT_HEADLESS` — режим браузера (`true`/`false`).
 - `PLAYWRIGHT_TZ` — временная зона браузера (по умолчанию `Europe/Moscow`).

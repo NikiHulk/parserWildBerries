@@ -28,6 +28,11 @@ def _build_dispatcher(banned_words: BannedWordsService) -> Dispatcher:
 
 async def main() -> None:
     settings = get_settings()
+    logging.getLogger(__name__).info(
+        "WB detail config: max_batch=%s split_on_empty=%s",
+        settings.wb_detail_max_batch,
+        settings.wb_detail_split_on_empty,
+    )
     bot = Bot(settings.telegram_token)
     database = Database(settings.database_url)
     database.migrate()

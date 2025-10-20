@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     tg_top_k: int = Field(default=3, env="TG_TOP_K")
     tg_cancel_text: str = Field(default="❌ Отмена", env="TG_CANCEL_TEXT")
     tg_skip_text: str = Field(default="⏭ Пропустить", env="TG_SKIP_TEXT")
+    wb_detail_max_batch: int = Field(default=1, env="WB_DETAIL_MAX_BATCH")
+    wb_detail_split_on_empty: bool = Field(
+        default=True, env="WB_DETAIL_SPLIT_ON_EMPTY"
+    )
     min_rating: float | None = Field(default=None, env="MIN_RATING")
     min_feedbacks: int | None = Field(default=None, env="MIN_FEEDBACKS")
     min_discount: float | None = Field(default=None, env="MIN_DISCOUNT")
