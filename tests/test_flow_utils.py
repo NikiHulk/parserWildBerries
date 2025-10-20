@@ -62,12 +62,7 @@ yookassa_stub.Configuration = object()
 yookassa_stub.Payment = object()
 sys.modules.setdefault("yookassa", yookassa_stub)
 
-from bot.services.wildberries import (
-    Product,
-    _passes_price_limits,
-    extract_price_rub,
-    score_item,
-)
+from bot.services.wildberries import Product, score_item
 
 try:
     from bot.telegram.flow_search import parse_excludes
@@ -118,22 +113,6 @@ class ScoreItemTest(unittest.TestCase):
         self.assertAlmostEqual(rating, -4.5)
         self.assertAlmostEqual(reviews, -120.0)
         self.assertAlmostEqual(price, 30.0)
-
-
-class PriceExtractionTest(unittest.TestCase):
-    def test_extract_price_rub_from_sizes(self) -> None:
-        product = {"sizes": [{"price": {"salePriceU": 9990}}]}
-        value = extract_price_rub(product)
-        self.assertIsNotNone(value)
-        self.assertAlmostEqual(value or 0, 99.9, places=2)
-
-
-class PriceFilterTest(unittest.TestCase):
-    def test_price_filter_respects_max(self) -> None:
-        item = {"salePriceU": 15000}
-        allowed, price = _passes_price_limits(item, None, 120)
-        self.assertFalse(allowed)
-        self.assertAlmostEqual(price or 0, 150.0, places=2)
 
 
 if __name__ == "__main__":

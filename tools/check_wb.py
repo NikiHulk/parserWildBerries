@@ -116,6 +116,12 @@ async def _run(args: argparse.Namespace) -> None:
             extra_parts.append("detail:" + " ".join(detail_parts))
         if summary.get("detail_dom_only"):
             extra_parts.append("detail_dom_only=1")
+        price_before = summary.get("price_sample_before")
+        price_after = summary.get("price_sample_after")
+        if price_before:
+            extra_parts.append(f"price_before={price_before}")
+        if price_after:
+            extra_parts.append(f"price_after={price_after}")
         extra = f" {' '.join(extra_parts)}" if extra_parts else ""
         html_status = summary.get("html_status")
         print(

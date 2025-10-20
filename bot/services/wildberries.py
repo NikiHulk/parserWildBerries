@@ -229,51 +229,78 @@ def _extract_numeric(item: Any, *names: str) -> float | int | None:
 
 
 def extract_price_rub(prod: Mapping[str, Any] | Any) -> float | None:
-    """Ищет минимальную положительную цену в копейках и возвращает её в рублях."""
+    """Возвращает нормализованную цену в рублях, учитывая новые схемы WB."""
 
-    keys = ("salePriceU", "priceU", "basicPriceU", "totalPriceU")
+    cached: Any
+    if isinstance(prod, Mapping):
+        cached = prod.get("_price_rub")
+    else:
+        cached = getattr(prod, "_price_rub", None)
+    if cached is not None:
+        try:
+            return float(cached)
+        except (TypeError, ValueError):  # noqa: BLE001
+            cached = None
+
+    price_keys_u = ("salePriceU", "priceU", "basicPriceU", "totalPriceU", "minPriceU")
+    price_keys_new = ("product", "total", "basic", "minPrice")
+    nested_keys = ("extended", "totalPrice")
     candidates: list[int] = []
 
-    def _collect(source: Mapping[str, Any] | Any) -> None:
-        if isinstance(source, Mapping):
-            for key in keys:
-                value = source.get(key)
-                if isinstance(value, int) and value > 0:
-                    candidates.append(value)
-        else:
-            for key in keys:
-                value = getattr(source, key, None)
-                if isinstance(value, int) and value > 0:
-                    candidates.append(value)
+    def _collect_from_block(block: Mapping[str, Any]) -> None:
+        for key in price_keys_u:
+            value = block.get(key)
+            if isinstance(value, int) and value > 0:
+                candidates.append(value)
+        for key in price_keys_new:
+            value = block.get(key)
+            if isinstance(value, int) and value > 0:
+                candidates.append(value)
+        for nested in nested_keys:
+            nested_value = block.get(nested)
+            if isinstance(nested_value, Mapping):
+                _collect_from_block(nested_value)
 
-    _collect(prod)
-
+    sizes = []
     if isinstance(prod, Mapping):
-        sizes = prod.get("sizes")
+        sizes = prod.get("sizes") or []
     else:
-        sizes = getattr(prod, "sizes", None)
+        sizes = getattr(prod, "sizes", []) or []
 
     if isinstance(sizes, Sequence):
         for size in sizes:
-            price_block: Any
+            price_block: Any = None
             if isinstance(size, Mapping):
                 price_block = size.get("price")
             else:
                 price_block = getattr(size, "price", None)
             if isinstance(price_block, Mapping):
-                _collect(price_block)
-            elif price_block is not None:
-                _collect(price_block)
+                _collect_from_block(price_block)
+
+    if isinstance(prod, Mapping):
+        for key in ("salePriceU", "priceU", "basicPriceU"):
+            value = prod.get(key)
+            if isinstance(value, int) and value > 0:
+                candidates.append(value)
+    else:
+        for key in ("salePriceU", "priceU", "basicPriceU"):
+            value = getattr(prod, key, None)
+            if isinstance(value, int) and value > 0:
+                candidates.append(value)
 
     if not candidates:
         return None
-    return min(candidates) / 100.0
+
+    price_rub = min(candidates) / 100.0
+    if isinstance(prod, dict):
+        prod.setdefault("_price_rub", price_rub)
+    return price_rub
 
 
 def _passes_price_limits(
     item: Mapping[str, Any] | Any,
-    eff_min: int | None,
-    eff_max: int | None,
+    eff_min: float | None,
+    eff_max: float | None,
 ) -> tuple[bool, float | None]:
     """Checks price limits and returns (allowed, extracted_price)."""
 
@@ -283,7 +310,7 @@ def _passes_price_limits(
     else:
         stored = getattr(item, "_price_rub", None)
 
-    price = None
+    price: float | None = None
     if stored is not None:
         try:
             price = float(stored)
@@ -836,15 +863,28 @@ class WildberriesClient:
                     max_price_rub,
                     len(products_list),
                 )
+
+                price_sample_before: list[tuple[Any, Any]] = []
+                for sample_item in products_list[:5]:
+                    nm_id = sample_item.get("id") if isinstance(sample_item, Mapping) else None
+                    price_keys: list[str] = []
+                    if isinstance(sample_item, Mapping):
+                        sizes_for_sample = sample_item.get("sizes") or []
+                    else:
+                        sizes_for_sample = getattr(sample_item, "sizes", []) or []
+                    if sizes_for_sample:
+                        first_size = sizes_for_sample[0]
+                        price_block = None
+                        if isinstance(first_size, Mapping):
+                            price_block = first_size.get("price")
+                        else:
+                            price_block = getattr(first_size, "price", None)
+                        if isinstance(price_block, Mapping):
+                            price_keys = list(price_block.keys())[:8]
+                    price_sample_before.append((nm_id, price_keys))
+
                 if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "price_sample_before=%s",
-                        [
-                            (p.get("_price_rub") if isinstance(p, Mapping) else None)
-                            or extract_price_rub(p)
-                            for p in products_list[:5]
-                        ],
-                    )
+                    logger.debug("price_sample_before=%s", price_sample_before)
 
                 page_candidates: list[dict[str, Any]] = []
                 for item in products_list:
@@ -940,6 +980,16 @@ class WildberriesClient:
                         }
                     )
 
+                price_sample_after: list[tuple[Any, Any]] = []
+                for candidate in page_candidates[:5]:
+                    candidate_item = candidate.get("item", {})
+                    nm_id = None
+                    if isinstance(candidate_item, Mapping):
+                        nm_id = candidate_item.get("id")
+                    else:
+                        nm_id = getattr(candidate_item, "id", None)
+                    price_sample_after.append((nm_id, candidate.get("price_rub")))
+
                 self._log_page_fetch(
                     page=page,
                     page_meta=page_meta,
@@ -951,13 +1001,12 @@ class WildberriesClient:
                     top_items=top_items,
                     eff_min=min_price_rub,
                     eff_max=max_price_rub,
+                    price_sample_before=price_sample_before,
+                    price_sample_after=price_sample_after,
                 )
 
                 if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "price_sample_after=%s",
-                        [candidate.get("price_rub") for candidate in page_candidates[:5]],
-                    )
+                    logger.debug("price_sample_after=%s", price_sample_after)
 
                 if page_meta.had_429:
                     rate_limit_hits += 1
@@ -1507,8 +1556,10 @@ class WildberriesClient:
         after_quality: int,
         total: int,
         top_items: list[dict[str, Any]] | None = None,
-        eff_min: int | None = None,
-        eff_max: int | None = None,
+        eff_min: float | None = None,
+        eff_max: float | None = None,
+        price_sample_before: list[tuple[Any, Any]] | None = None,
+        price_sample_after: list[tuple[Any, Any]] | None = None,
     ) -> None:
         summary = {
             "page": page,
@@ -1544,6 +1595,8 @@ class WildberriesClient:
             "detail_used_v4": page_meta.detail_used_v4,
             "eff_min": eff_min,
             "eff_max": eff_max,
+            "price_sample_before": list(price_sample_before or []),
+            "price_sample_after": list(price_sample_after or []),
         }
         self._last_page_logs.append(summary)
         proxy_used = summary["proxy"]
@@ -1601,7 +1654,7 @@ class WildberriesClient:
             extra_suffix,
         )
         logger.info(
-            "WB filter page=%s before=%s after_price=%s after_banned=%s after_quality=%s total=%s eff_min=%s eff_max=%s",
+            "WB filter page=%s before=%s after_price=%s after_banned=%s after_quality=%s total=%s eff_min=%s eff_max=%s price_sample_before=%s price_sample_after=%s",
             page,
             before_count,
             after_price,
@@ -1610,6 +1663,8 @@ class WildberriesClient:
             total,
             eff_min,
             eff_max,
+            summary.get("price_sample_before"),
+            summary.get("price_sample_after"),
         )
 
     def _cache_key(
