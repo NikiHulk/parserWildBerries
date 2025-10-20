@@ -177,6 +177,7 @@ async def process_max_price(
             exclude_words=user_banned,
             max_results=settings.max_results,
             timeout=settings.request_timeout,
+            max_pages=settings.tg_search_max_pages,
         )
     except httpx.HTTPError:
         await message.answer(

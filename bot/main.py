@@ -33,6 +33,16 @@ async def main() -> None:
         settings.wb_detail_max_batch,
         settings.wb_detail_split_on_empty,
     )
+    logging.getLogger(__name__).info(
+        "TG search config: timeout=%s max_pages=%s progress_interval=%s",
+        settings.tg_search_timeout,
+        settings.tg_search_max_pages,
+        settings.tg_progress_interval,
+    )
+    logging.getLogger(__name__).info(
+        "HTML fallback limit: %sms",
+        settings.html_max_page_ms,
+    )
     bot = Bot(settings.telegram_token)
     database = Database(settings.database_url)
     database.migrate()

@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import math
 import re
+from contextlib import suppress
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List
 
-import httpx
 from aiogram import F, Router
-from aiogram.enums import ParseMode
+from aiogram.enums import ChatAction, ParseMode
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, ErrorEvent, Message
 
 from ..config import get_settings
 from ..services.wildberries import WildberriesClient, build_image_url, score_item
@@ -26,6 +28,8 @@ from .ui import (
     pager_kb,
     remove_kb,
 )
+
+logger = logging.getLogger(__name__)
 
 router = Router()
 
@@ -89,6 +93,16 @@ def parse_excludes(raw: str | None) -> List[str]:
         and token not in banned_symbols
         and len(token) > 1
     ]
+
+
+async def _progress(bot, chat_id: int, interval: int) -> None:
+    interval = max(1, interval)
+    try:
+        while True:
+            await bot.send_chat_action(chat_id, ChatAction.TYPING)
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:  # pragma: no cover - cooperative cancellation
+        return
 
 
 def _product_matches_excludes(product: Any, excludes: List[str]) -> bool:
@@ -435,53 +449,72 @@ async def handle_excludes(message: Message, state: FSMContext) -> None:
         min_discount=settings.min_discount,
     )
 
-    progress_message = await message.answer(
-        "Ищу подходящие товары...",
+    await _clear_previous_results(message.bot, message.chat.id, state)
+
+    status_message = await message.answer(
+        settings.tg_progress_text,
         reply_markup=remove_kb(),
     )
 
-    try:
-        products = await client.search_products(
-            query=query,
-            max_price_rub=max_price_rub,
-            exclude_words=banned_words,
-            top_k=TOP_K,
-            max_results=max(settings.max_results, PAGE_SIZE * 5),
-            timeout=settings.request_timeout,
+    progress_task = asyncio.create_task(
+        _progress(
+            message.bot,
+            message.chat.id,
+            settings.tg_progress_interval,
         )
-    except httpx.HTTPError:
-        if progress_message:
-            try:
-                await message.bot.delete_message(
-                    message.chat.id, progress_message.message_id
-                )
-            except Exception:  # noqa: BLE001
-                pass
+    )
+
+    products: List[Any] = []
+
+    try:
+        async with asyncio.timeout(settings.tg_search_timeout):
+            products = await client.search_products(
+                query=query,
+                max_price_rub=max_price_rub,
+                exclude_words=banned_words,
+                top_k=TOP_K,
+                max_results=max(settings.max_results, PAGE_SIZE * 5),
+                timeout=settings.request_timeout,
+                max_pages=settings.tg_search_max_pages,
+            )
+    except asyncio.TimeoutError:
+        logger.warning("TG search timeout: query=%r", query)
         await state.clear()
         await message.answer(
-            "Не удалось получить данные от Wildberries. Попробуйте позже.",
+            "⏳ Поиск занял слишком много времени. Попробуйте снизить порог цены, убрать исключения или повторить позже.",
             reply_markup=main_kb(),
         )
-        return
-
-    if not products:
-        if progress_message:
+        products = []
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("TG search failed: query=%r", query, exc_info=exc)
+        await state.clear()
+        await message.answer(
+            "⚠️ Произошла ошибка при поиске. Попробуйте ещё раз.",
+            reply_markup=main_kb(),
+        )
+        products = []
+    finally:
+        progress_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await progress_task
+        if status_message:
             try:
                 await message.bot.delete_message(
-                    message.chat.id, progress_message.message_id
+                    message.chat.id, status_message.message_id
                 )
             except Exception:  # noqa: BLE001
                 pass
+
+    if not products:
         await state.clear()
         await message.answer(
-            "По заданным критериям ничего не найдено.",
+            "По заданным критериям ничего не найдено. Попробуйте увеличить верхний порог цены или убрать часть исключений.",
             reply_markup=main_kb(),
         )
         return
 
     payloads = [_product_to_payload(product) for product in products]
-    items = sorted(payloads, key=score_item)
-    items = items[:TOP_K]
+    items = sorted(payloads, key=score_item)[:TOP_K]
 
     await state.update_data(
         results=items,
@@ -498,14 +531,6 @@ async def handle_excludes(message: Message, state: FSMContext) -> None:
         items=items,
         page=0,
     )
-
-    if progress_message:
-        try:
-            await message.bot.delete_message(
-                message.chat.id, progress_message.message_id
-            )
-        except Exception:  # noqa: BLE001
-            pass
 
 
 @router.callback_query(SearchStates.showing_results, F.data.startswith("pg:"))
@@ -536,6 +561,18 @@ async def handle_cancel_in_results(message: Message, state: FSMContext) -> None:
     await _clear_previous_results(message.bot, message.chat.id, state)
     await state.clear()
     await message.answer(WELCOME_TEXT, reply_markup=main_kb())
+
+
+@router.errors()
+async def handle_flow_error(event: ErrorEvent) -> None:
+    logger.exception("Unhandled error in Telegram flow", exc_info=event.exception)
+    update = event.update
+    reply_text = "⚠️ Произошла ошибка. Попробуйте ещё раз."
+    if update.message:
+        await update.message.answer(reply_text, reply_markup=main_kb())
+    elif update.callback_query and update.callback_query.message:
+        await update.callback_query.message.answer(reply_text, reply_markup=main_kb())
+    event.handled = True
 
 
 @router.message()

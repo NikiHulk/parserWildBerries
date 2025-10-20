@@ -68,6 +68,7 @@ async def _run(args: argparse.Namespace) -> None:
         exclude_words=banned,
         max_results=args.limit or settings.max_results,
         timeout=settings.request_timeout,
+        max_pages=settings.tg_search_max_pages,
     )
 
     for summary in client.last_page_logs:

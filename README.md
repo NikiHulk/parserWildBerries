@@ -39,6 +39,10 @@ TG_WELCOME_TEXT="Добро пожаловать! Нажмите «🔎 Поис
 TG_TOP_K=3
 TG_CANCEL_TEXT="❌ Отмена"
 TG_SKIP_TEXT="⏭ Пропустить"
+TG_SEARCH_TIMEOUT=120
+TG_SEARCH_MAX_PAGES=2
+TG_PROGRESS_INTERVAL=4
+TG_PROGRESS_TEXT="Ищу подходящие товары..."
 WB_DEFAULT_MIN_PRICE=
 WB_DEFAULT_MAX_PRICE=
 WB_DEFAULT_LIMIT=8
@@ -50,6 +54,7 @@ PLAYWRIGHT_TZ=Europe/Moscow
 PLAYWRIGHT_STATE_PATH=/app/data/wb_playwright_state.json
 PLAYWRIGHT_USER_DATA_DIR=data
 PLAYWRIGHT_PROXY=
+HTML_MAX_PAGE_MS=45000
 PROXY_POOL=
 HTTPX_PROXY=
 WB_HTTP_PROXY=
@@ -60,6 +65,29 @@ HTTPS_PROXY=
 YOOKASSA_SHOP_ID=
 YOOKASSA_SECRET_KEY=
 YOOKASSA_RETURN_URL=
+```
+
+### Быстрое обновление конфигурации поиска
+
+Чтобы изменить таймауты и лимиты поискового мастера, добавьте или скорректируйте переменные
+`TG_SEARCH_TIMEOUT`, `TG_SEARCH_MAX_PAGES`, `TG_PROGRESS_INTERVAL`, `TG_PROGRESS_TEXT` и
+`HTML_MAX_PAGE_MS` в `.env`, затем пересоберите и перезапустите контейнер:
+
+```bash
+# .env
+TG_SEARCH_TIMEOUT=120
+TG_SEARCH_MAX_PAGES=2
+TG_PROGRESS_INTERVAL=4
+TG_PROGRESS_TEXT="Ищу подходящие товары..."
+HTML_MAX_PAGE_MS=45000
+
+# пересобрать без кэша
+sudo docker build --no-cache -t wb-bot:latest .
+sudo docker rm -f wb-bot || true
+sudo docker run -d --restart unless-stopped --name wb-bot \
+  --env-file ~/parserWildBerries/.env \
+  -v /opt/wb_state:/app/data \
+  wb-bot:latest
 ```
 
 ## Запуск
@@ -87,6 +115,7 @@ python -m bot.main
 - `PLAYWRIGHT_STATE_PATH` — файл `storage_state`, где сохраняются cookies/локальные данные (по умолчанию `/app/data/wb_playwright_state.json`).
 - `PLAYWRIGHT_USER_DATA_DIR` — директория для вспомогательных данных Playwright (`data` по умолчанию).
 - `PLAYWRIGHT_PROXY` — фиксированный прокси только для Playwright. Если не указан, клиент будет чередовать значения из `PROXY_POOL`.
+- `HTML_MAX_PAGE_MS` — мягкий лимит на обработку одной HTML-страницы в Playwright (по умолчанию 45 000 мс), помогает избегать зависаний.
 - `PROXY_POOL` — список прокси через запятую (`http://user:pass@ip:port`). Прокси ротируются по кругу с липким окном 60–120 с; при 403/498/429 или таймаутах используется следующий адрес. Рекомендуются residential/ISP RU-прокси со sticky-сеансами 10–30 минут.
 - `HTTPX_PROXY` / `WB_HTTP_PROXY` / `HTTP_PROXY` — прокси для HTTP-запросов (JSON API Wildberries, Telegram и т.д.). Клиент использует первое непустое значение в указанном порядке и логирует его в отчёте (лог без логина/пароля).
 

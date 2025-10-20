@@ -50,6 +50,7 @@ PLAYWRIGHT_STORAGE_FILE = Path(
     os.getenv("PLAYWRIGHT_STATE_PATH", "/app/data/wb_playwright_state.json")
 )
 HTML_SETTLE_MS = int(os.getenv("PLAYWRIGHT_THROTTLE_MS", "800") or "800")
+HTML_MAX_PAGE_MS = max(1000, int(os.getenv("HTML_MAX_PAGE_MS", "45000") or "45000"))
 
 START_LIMIT = 20
 MAX_CATALOG_ATTEMPTS = 2
@@ -556,6 +557,7 @@ class WildberriesClient:
         self._cookie_lock = asyncio.Lock()
         self._storage_state_file = PLAYWRIGHT_STORAGE_FILE
         self._html_settle_ms = HTML_SETTLE_MS
+        self._html_page_timeout_ms = HTML_MAX_PAGE_MS
         headless_env = os.getenv("PLAYWRIGHT_HEADLESS")
         self._playwright_headless = not (
             headless_env and headless_env.strip().lower() in {"0", "false", "no"}
@@ -724,6 +726,7 @@ class WildberriesClient:
         top_k: int | None = None,
         max_results: int | None = None,
         timeout: float | None = None,
+        max_pages: int | None = None,
     ) -> List[Product]:
         self._last_page_logs = []
 
@@ -773,6 +776,17 @@ class WildberriesClient:
             if isinstance(word, str) and word.strip()
         }
 
+        eff_max_pages = None
+        if max_pages is not None:
+            try:
+                parsed_pages = int(max_pages)
+            except (TypeError, ValueError):  # noqa: BLE001
+                parsed_pages = None
+            if parsed_pages is not None and parsed_pages > 0:
+                eff_max_pages = parsed_pages
+
+        logger.info("WB search start: query=%r eff_max_pages=%s", query, eff_max_pages)
+
         filtered_candidates: list[dict[str, Any]] = []
         filtered_by_price = 0
         filtered_by_banned = 0
@@ -792,6 +806,12 @@ class WildberriesClient:
 
         try:
             while len(filtered_candidates) < collect_limit:
+                if eff_max_pages is not None and page > eff_max_pages:
+                    logger.info(
+                        "WB search stop: reached page limit %s", eff_max_pages
+                    )
+                    break
+
                 client = await self._ensure_http_client(
                     session_headers, effective_timeout
                 )
@@ -804,6 +824,7 @@ class WildberriesClient:
                     limit=current_limit,
                     timeout=effective_timeout,
                     force_html_first=self.force_html_first,
+                    max_pages=eff_max_pages,
                 )
 
                 raw_products = page_meta.products or []
@@ -1711,6 +1732,7 @@ class WildberriesClient:
         limit: int,
         timeout: float,
         force_html_first: bool,
+        max_pages: int | None,
     ) -> PageFetchMeta:
         start_time = time.monotonic()
         encountered_429 = False
@@ -1725,6 +1747,7 @@ class WildberriesClient:
                 timeout=timeout,
                 encountered_429=False,
                 start_time=start_time,
+                max_pages=max_pages,
             )
 
         attempts_made = 0
@@ -1807,6 +1830,7 @@ class WildberriesClient:
                         timeout=timeout,
                         encountered_429=encountered_429,
                         start_time=start_time,
+                        max_pages=max_pages,
                     )
 
                 if attempts_made >= MAX_CATALOG_ATTEMPTS:
@@ -1864,6 +1888,7 @@ class WildberriesClient:
                         timeout=timeout,
                         encountered_429=encountered_429,
                         start_time=start_time,
+                        max_pages=max_pages,
                     )
 
             if attempts_made >= MAX_CATALOG_ATTEMPTS:
@@ -1878,6 +1903,7 @@ class WildberriesClient:
             timeout=timeout,
             encountered_429=encountered_429,
             start_time=start_time,
+            max_pages=max_pages,
         )
 
 
@@ -1893,6 +1919,7 @@ class WildberriesClient:
         timeout: float,
         encountered_429: bool,
         start_time: float,
+        max_pages: int | None,
     ) -> PageFetchMeta:
         """HTML fallback powered by Playwright with proxy-safe launch args and DOM harvesting."""
         try:
@@ -1904,6 +1931,12 @@ class WildberriesClient:
             raise
 
         html_url = url_html_search(query, page)
+        logger.info(
+            "[WB/Playwright] html_fallback start: page=%s max_pages=%s limit_ms=%s",
+            page,
+            max_pages,
+            self._html_page_timeout_ms,
+        )
         nm_ids: list[int] = []
         source = "html_xhr"
         max_attempts = 6
@@ -1913,6 +1946,8 @@ class WildberriesClient:
         ids_from_dom: list[int] = []
         last_html_length = 0
         last_html_anti_bot = False
+        page_time_limit_ms = max(1000, self._html_page_timeout_ms)
+        page_deadline = start_time + page_time_limit_ms / 1000.0
 
         def anti_bot_detected(status: int | None, body: str | None) -> bool:
             if status in {403, 497, 498}:
@@ -1924,6 +1959,12 @@ class WildberriesClient:
                 re.IGNORECASE,
             )
             return bool(pattern.search(body))
+
+        def bounded_timeout_ms(candidate: int) -> int:
+            remaining = int((page_deadline - time.monotonic()) * 1000)
+            if remaining <= 0:
+                return 0
+            return max(0, min(candidate, remaining))
 
         async def collect_dom_ids(page_obj) -> list[int]:  # type: ignore[no-untyped-def]
             ids: list[int] = []
@@ -2001,6 +2042,12 @@ class WildberriesClient:
             return ids[:MAX_HTML_IDS]
 
         while attempt < max_attempts and not nm_ids:
+            if time.monotonic() >= page_deadline:
+                logger.info(
+                    "[WB/Playwright] html_fallback deadline reached for page=%s",
+                    page,
+                )
+                break
             attempt += 1
             proxy_for_log = sanitize_proxy(
                 self._proxy_current or self._current_http_proxy_raw()
@@ -2077,7 +2124,7 @@ class WildberriesClient:
                 goto_response = await page_obj.goto(
                     html_url,
                     wait_until="domcontentloaded",
-                    timeout=60000,
+                    timeout=min(60000, max(1000, int(page_time_limit_ms))),
                 )
                 last_status = goto_response.status if goto_response is not None else None
                 try:
@@ -2098,24 +2145,38 @@ class WildberriesClient:
                 throttle_base = max(600, self._html_settle_ms)
                 initial_wait_min = max(1500, int(throttle_base * 1.5))
                 initial_wait_max = max(2200, int(throttle_base * 2.2))
-                await page_obj.wait_for_timeout(random.randint(initial_wait_min, initial_wait_max))
-                try:
-                    await page_obj.wait_for_selector("input#searchInput", timeout=5000)
-                except PlaywrightTimeoutError:
-                    pass
+                wait_ms = bounded_timeout_ms(
+                    random.randint(initial_wait_min, initial_wait_max)
+                )
+                if wait_ms <= 0:
+                    break
+                await page_obj.wait_for_timeout(wait_ms)
+                selector_timeout = bounded_timeout_ms(5000)
+                if selector_timeout > 0:
+                    try:
+                        await page_obj.wait_for_selector(
+                            "input#searchInput", timeout=selector_timeout
+                        )
+                    except PlaywrightTimeoutError:
+                        pass
 
                 scroll_iterations = random.randint(2, 4)
                 for _ in range(scroll_iterations):
+                    if time.monotonic() >= page_deadline:
+                        break
                     try:
                         await page_obj.mouse.wheel(0, random.randint(900, 1400))
                     except Exception:  # noqa: BLE001
                         pass
-                    await page_obj.wait_for_timeout(
+                    wait_scroll = bounded_timeout_ms(
                         random.randint(
                             max(500, int(throttle_base * 0.6)),
                             max(900, int(throttle_base)),
                         )
                     )
+                    if wait_scroll <= 0:
+                        break
+                    await page_obj.wait_for_timeout(wait_scroll)
 
                 if responses:
                     logger.info("[WB/Playwright] JSON XHR найден: %s", len(responses))

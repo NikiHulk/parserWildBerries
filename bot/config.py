@@ -28,10 +28,18 @@ class Settings(BaseSettings):
     tg_top_k: int = Field(default=3, env="TG_TOP_K")
     tg_cancel_text: str = Field(default="❌ Отмена", env="TG_CANCEL_TEXT")
     tg_skip_text: str = Field(default="⏭ Пропустить", env="TG_SKIP_TEXT")
+    tg_search_timeout: int = Field(default=120, env="TG_SEARCH_TIMEOUT")
+    tg_search_max_pages: int = Field(default=2, env="TG_SEARCH_MAX_PAGES")
+    tg_progress_interval: int = Field(default=4, env="TG_PROGRESS_INTERVAL")
+    tg_progress_text: str = Field(
+        default="Ищу подходящие товары...",
+        env="TG_PROGRESS_TEXT",
+    )
     wb_detail_max_batch: int = Field(default=1, env="WB_DETAIL_MAX_BATCH")
     wb_detail_split_on_empty: bool = Field(
         default=True, env="WB_DETAIL_SPLIT_ON_EMPTY"
     )
+    html_max_page_ms: int = Field(default=45000, env="HTML_MAX_PAGE_MS")
     min_rating: float | None = Field(default=None, env="MIN_RATING")
     min_feedbacks: int | None = Field(default=None, env="MIN_FEEDBACKS")
     min_discount: float | None = Field(default=None, env="MIN_DISCOUNT")
