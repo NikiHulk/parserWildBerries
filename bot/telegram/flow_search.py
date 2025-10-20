@@ -11,7 +11,7 @@ from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List
 
 from aiogram import F, Router
-from aiogram.enums import ChatAction, ParseMode
+from aiogram.enums import ChatAction
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -19,7 +19,6 @@ from aiogram.types import CallbackQuery, ErrorEvent, Message
 
 from ..config import get_settings
 from ..services.wildberries import WildberriesClient, build_image_url, score_item
-from .render import build_caption
 from .ui import (
     SEARCH_BUTTON,
     cancel_kb,
@@ -237,6 +236,37 @@ def _product_to_payload(product: Any) -> Dict[str, Any]:
     }
 
 
+def _format_card_text(item: Dict[str, Any], rank: int) -> str:
+    price = item.get("_price_rub")
+    price_str = f"{price:.0f}₽" if isinstance(price, (int, float)) else "—"
+
+    score = item.get("_score")
+    score_str = f"{score:.4f}" if isinstance(score, (int, float)) else "—"
+
+    rating = item.get("rating")
+    rating_str = f"{rating:.1f}" if isinstance(rating, (int, float)) else "—"
+
+    reviews = item.get("feedbacks") or item.get("reviews") or 0
+    try:
+        reviews_str = str(int(reviews))
+    except (TypeError, ValueError):
+        reviews_str = str(reviews) if reviews is not None else "0"
+
+    name = item.get("name") or item.get("title") or "Без названия"
+    url = (
+        item.get("detail_url")
+        or item.get("url")
+        or f"https://www.wildberries.ru/catalog/{item.get('id')}/detail.aspx"
+    )
+
+    lines = [
+        f"#{rank} | id={item.get('id')} | {name}",
+        f"цена={price_str} | score={score_str} | rating={rating_str} | reviews={reviews_str}",
+        f"URL: {url}",
+    ]
+    return "\n".join(lines).strip()
+
+
 async def _clear_previous_results(bot, chat_id: int, state: FSMContext) -> None:
     data = await state.get_data()
     previous_ids: List[int] = data.get("product_message_ids", [])
@@ -287,23 +317,22 @@ async def _send_page(bot, chat_id: int, state: FSMContext, items: List[Dict[str,
     chunk = items[start_index:end_index]
 
     new_message_ids: List[int] = []
-    for product in chunk:
-        target_buy = product.get("best_buy_price")
-        caption = build_caption(product, target_buy_price=target_buy)
-        image_url = product.get("image_url")
-        if image_url:
-            sent = await bot.send_photo(
-                chat_id,
-                photo=image_url,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-            )
-        else:
+    for index, product in enumerate(chunk, start=1):
+        text = _format_card_text(product, index)
+        try:
             sent = await bot.send_message(
                 chat_id,
-                caption,
-                parse_mode=ParseMode.HTML,
+                text,
                 disable_web_page_preview=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            fallback_text = (
+                f"{text}\n\n(Предупреждение: не удалось отправить сообщение как задумано: {exc})"
+            )
+            sent = await bot.send_message(
+                chat_id,
+                fallback_text,
+                disable_web_page_preview=True,
             )
         new_message_ids.append(sent.message_id)
 
